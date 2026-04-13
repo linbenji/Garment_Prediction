@@ -243,13 +243,16 @@ class HybridDrapeModel(nn.Module):
         style_emb = self.vit(data.image)          # (B, 128)
 
         # ── Step 2: Broadcast global conditioning to every node ───────────────
-        # data.batch maps each node to its graph index in the batch
-        b = data.batch                            # (total_nodes,)
+        # data.batch maps each node to its graph index in the batch.
+        # PyG concatenates per-graph tensors into (B*dim,) during batching
+        # so we must reshape to (B, dim) before indexing with data.batch.
+        b = data.batch                                      # (total_nodes,)
+        B = style_emb.shape[0]
 
-        node_style   = style_emb[b]               # (total_nodes, 128)
-        node_smpl    = data.tgt_smpl[b]           # (total_nodes, 10)
-        node_physics = data.tgt_physics[b]        # (total_nodes, 10)
-        node_size    = data.tgt_size[b]           # (total_nodes, 2)
+        node_style   = style_emb[b]                         # (total_nodes, 128)
+        node_smpl    = data.tgt_smpl.view(B, SMPL_DIM)[b]   # (total_nodes, 10)
+        node_physics = data.tgt_physics.view(B, PHYSICS_DIM)[b]  # (total_nodes, 10)
+        node_size    = data.tgt_size.view(B, SIZE_DIM)[b]   # (total_nodes, 2)
 
         # ── Step 3: Build node feature vector ────────────────────────────────
         # [pos | uvs | normals | style | smpl | physics | size] = 158-dim
@@ -347,15 +350,25 @@ if __name__ == '__main__':
     print("\nBuilding model (skipping DINOv2 download)...")
 
     class DummyViT(nn.Module):
+        """Stands in for StyleViT_DINO during smoke test."""
         def forward(self, x):
             return torch.zeros(x.shape[0], STYLE_DIM)
 
-    model = HybridDrapeModel()
-    model.vit = type('DummyVIT', (nn.Module,), {
-        'forward': lambda self, x: torch.zeros(x.shape[0], STYLE_DIM),
-        'parameters': lambda self, **kw: iter([]),
-    })()
+    # Patch HybridDrapeModel to use DummyViT so DINOv2 is never downloaded
+    class HybridDrapeModelTest(HybridDrapeModel):
+        def __init__(self):
+            # Call nn.Module.__init__ directly to skip StyleViT_DINO init
+            nn.Module.__init__(self)
+            self.vit              = DummyViT()
+            self.node_encoder     = build_mlp(NODE_IN_DIM, LATENT_DIM)
+            self.edge_encoder     = build_mlp(EDGE_IN_DIM, LATENT_DIM)
+            self.processor        = nn.ModuleList([
+                MeshBlock(LATENT_DIM) for _ in range(GNN_LAYERS)
+            ])
+            self.decoder          = nn.Linear(LATENT_DIM, 3)
+            self.fabric_classifier = nn.Linear(STYLE_DIM, NUM_FABRIC_FAMILIES)
 
+    model = HybridDrapeModelTest()
     count_parameters(model)
 
     # Build a fake batch
@@ -387,12 +400,6 @@ if __name__ == '__main__':
 
     batch = Batch.from_data_list(graphs)
 
-    # Override vit with dummy
-    original_vit = model.vit
-    model.vit = lambda imgs: torch.zeros(imgs.shape[0], STYLE_DIM) \
-        if hasattr(imgs, 'shape') \
-        else torch.zeros(B, STYLE_DIM)
-
     print(f"\nFake batch:")
     print(f"  Graphs:      {B}")
     print(f"  Total nodes: {batch.pos.shape[0]}")
@@ -402,9 +409,9 @@ if __name__ == '__main__':
     style_emb    = torch.zeros(B, STYLE_DIM)
     b            = batch.batch
     node_style   = style_emb[b]
-    node_smpl    = batch.tgt_smpl[b]
-    node_physics = batch.tgt_physics[b]
-    node_size    = batch.tgt_size[b]
+    node_smpl    = batch.tgt_smpl.view(B, SMPL_DIM)[b]
+    node_physics = batch.tgt_physics.view(B, PHYSICS_DIM)[b]
+    node_size    = batch.tgt_size.view(B, SIZE_DIM)[b]
     x = torch.cat([batch.pos, batch.uvs, batch.normals,
                    node_style, node_smpl, node_physics, node_size], dim=-1)
 
