@@ -1,5 +1,5 @@
 """
-garment_dataset.py
+dataloader_v2.py
 
 PyTorch Geometric dataset for joint ViT + GNN garment drape prediction.
 
