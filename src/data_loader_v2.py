@@ -1,5 +1,5 @@
 """
-data_loader_v2.py
+garment_dataset.py
 
 PyTorch Geometric dataset for joint ViT + GNN garment drape prediction.
 
@@ -248,25 +248,112 @@ def make_dataloaders(root_dir, batch_size=16, num_workers=4,
 
 if __name__ == '__main__':
     import sys
-    root  = sys.argv[1] if len(sys.argv) > 1 \
-            else r'C:\Dev\Clothing_Project\batches\batch_4500'
-    split = sys.argv[2] if len(sys.argv) > 2 else 'train'
+    root = sys.argv[1] if len(sys.argv) > 1 \
+           else r'C:\Dev\Clothing_Project\batches\batch_1500_lean'
 
-    print(f"Smoke test  root={root}  split={split}\n")
-    ds     = GarmentDataset(root, split=split)
-    sample = ds[0]
+    print("=" * 65)
+    print("DATALOADER SMOKE TEST")
+    print("=" * 65)
+    print(f"Root: {root}\n")
 
-    print(f"\nDataset length: {len(ds)}")
-    print("\nSample fields:")
-    for key in sample.keys():
+    # ── Per-split sample count verification ──────────────────────────────────
+    print("── Split counts ──")
+    EXPECTED = {'train': 1127, 'val': 168, 'test': 180}
+    datasets  = {}
+    all_ok    = True
+    for split, expected in EXPECTED.items():
+        ds  = GarmentDataset(root, split=split)
+        ok  = len(ds) == expected
+        all_ok &= ok
+        status = "✓" if ok else "✗"
+        print(f"  {status} {split:6s}: {len(ds):4d} samples  (expected {expected})")
+        datasets[split] = ds
+
+    # ── Two-axis split leakage check ──────────────────────────────────────────
+    print("\n── Split leakage check ──")
+    import pandas as pd
+    df_train = datasets['train'].df
+    df_val   = datasets['val'].df
+    df_test  = datasets['test'].df
+
+    # heavy_woven must not appear in train
+    hw_in_train = (df_train['fabric_family'] == 'heavy_woven').sum()
+    ok = hw_in_train == 0
+    all_ok &= ok
+    print(f"  {'✓' if ok else '✗'} heavy_woven in train: {hw_in_train} (expected 0)")
+
+    # bodies 23-24 must not appear in train
+    unseen_in_train = df_train['body_id'].isin([23, 24]).sum()
+    ok = unseen_in_train == 0
+    all_ok &= ok
+    print(f"  {'✓' if ok else '✗'} bodies 23-24 in train: {unseen_in_train} (expected 0)")
+
+    # test must contain all three generalisation conditions
+    FAMILY_GROUP = {
+        'light_knit': 1, 'medium_knit': 2, 'heavy_knit': 3,
+        'light_woven': 4, 'medium_woven': 5, 'heavy_woven': 6,
+    }
+    df_test['fg'] = df_test['fabric_family'].map(FAMILY_GROUP)
+    seen_body_unseen_mat   = ((df_test['body_id'] <= 22) & (df_test['fg'] == 6)).sum()
+    unseen_body_seen_mat   = ((df_test['body_id'] >= 23) & (df_test['fg'] <= 5)).sum()
+    unseen_body_unseen_mat = ((df_test['body_id'] >= 23) & (df_test['fg'] == 6)).sum()
+
+    for label, val, exp in [
+        ("test seen body/unseen mat",   seen_body_unseen_mat,   100),
+        ("test unseen body/seen mat",   unseen_body_seen_mat,    60),
+        ("test unseen body/unseen mat", unseen_body_unseen_mat,  20),
+    ]:
+        ok = val == exp
+        all_ok &= ok
+        print(f"  {'✓' if ok else '✗'} {label}: {val} (expected {exp})")
+
+    # ── Single sample field check ─────────────────────────────────────────────
+    print("\n── Sample field check (train[0]) ──")
+    sample = datasets['train'][0]
+    EXPECTED_SHAPES = {
+        'pos':         (14117, 3),
+        'edge_index':  (2, 82988),
+        'edge_attr':   (82988, 4),
+        'uvs':         (14117, 2),
+        'normals':     (14117, 3),
+        'y':           (14117, 3),
+        'loss_weight': (14117,),
+        'tgt_smpl':    (10,),
+        'tgt_pose':    (72,),
+        'tgt_physics': (10,),
+        'tgt_size':    (2,),
+        'image':       (3, 224, 224),
+    }
+    for key, expected_shape in EXPECTED_SHAPES.items():
         val = getattr(sample, key)
-        if hasattr(val, 'shape'):
-            print(f"  {key:<25} shape={str(tuple(val.shape)):<20} {val.dtype}")
-        else:
-            print(f"  {key:<25} {val}")
+        ok  = tuple(val.shape) == expected_shape
+        all_ok &= ok
+        status = "✓" if ok else "✗"
+        print(f"  {status} {key:<25} {str(tuple(val.shape)):<20} "
+              f"{'OK' if ok else f'expected {expected_shape}'}")
 
+    # ── Displacement sanity ───────────────────────────────────────────────────
+    print("\n── Displacement sanity ──")
     disp = sample.y.norm(dim=1)
-    print(f"\nDisplacement  mean={disp.mean():.2f}mm  "
-          f"max={disp.max():.2f}mm  p99={disp.quantile(0.99):.2f}mm")
-    print(f"Physics vector: {sample.tgt_physics}")
-    print("\nSmoke test passed")
+    print(f"  mean={disp.mean():.2f}mm  max={disp.max():.2f}mm  "
+          f"p99={disp.quantile(0.99):.2f}mm")
+
+    # ── Physics sanity ────────────────────────────────────────────────────────
+    print("\n── Physics vector (log-normalised, should be ~N(0,1)) ──")
+    p = sample.tgt_physics
+    print(f"  mean={p.mean():.3f}  std={p.std():.3f}  "
+          f"min={p.min():.3f}  max={p.max():.3f}")
+
+    # ── Image sanity ──────────────────────────────────────────────────────────
+    print("\n── Image tensor ──")
+    img = sample.image
+    print(f"  shape={tuple(img.shape)}  "
+          f"min={img.min():.3f}  max={img.max():.3f}  mean={img.mean():.3f}")
+
+    # ── Final result ──────────────────────────────────────────────────────────
+    print("\n" + "=" * 65)
+    if all_ok:
+        print("✓ All smoke tests passed — dataloader ready for training")
+    else:
+        print("✗ Some checks failed — review output above")
+    print("=" * 65)
