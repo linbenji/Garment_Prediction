@@ -178,7 +178,7 @@ class GarmentDataset(Dataset):
             tgt_size    = tgt_size,             # (2,)
 
             # ViT input
-            image = image_tensor,               # (3, 224, 224)
+            image = image_tensor.unsqueeze(0),               # (1, 3, 224, 224)
 
             # Labels
             fabric_family_label = torch.tensor(
@@ -322,7 +322,7 @@ if __name__ == '__main__':
         'tgt_pose':    (72,),
         'tgt_physics': (10,),
         'tgt_size':    (2,),
-        'image':       (3, 224, 224),
+        'image':       (1, 3, 224, 224),
     }
     for key, expected_shape in EXPECTED_SHAPES.items():
         val = getattr(sample, key)

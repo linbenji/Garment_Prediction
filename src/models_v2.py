@@ -308,7 +308,7 @@ def drape_loss(predicted_delta, target_delta, loss_weight, fabric_logits,
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)  # (total_nodes,)
 
     # Weighted mean
-    d_loss = (sq_err * loss_weight).mean()
+    d_loss = (sq_err * loss_weight).mean() / 14117 # Normalized by vertex count 
 
     # Auxiliary classification loss
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
