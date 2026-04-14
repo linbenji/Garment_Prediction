@@ -40,9 +40,8 @@ from models_v2 import HybridDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_ROOT = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
-RUNS_DIR  = r"C:\Dev\Clothing_Project\runs"
-
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
 # ── OBJ writer ────────────────────────────────────────────────────────────────
 

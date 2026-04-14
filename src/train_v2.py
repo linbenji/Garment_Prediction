@@ -1,5 +1,5 @@
 """
-train.py
+train_v2.py
 
 Training loop for HybridDrapeModel (ViT + GNN garment drape prediction).
 Method 1 baseline: global conditioning via node feature concatenation.
@@ -30,6 +30,9 @@ warnings.filterwarnings("ignore", message="xFormers is not available")
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.loader import DataLoader
+import gc
+gc.collect()
+torch.cuda.empty_cache()
 
 # ── Add project root to path so imports work regardless of working directory ──
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -39,48 +42,51 @@ from models_v2 import HybridDrapeModel, drape_loss
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
-RUNS_DIR   = r"C:\Dev\Clothing_Project\runs"
+#DATA_ROOT = '/workspace/batch_1500_lean'
+#RUNS_DIR  = '/workspace/runs'
+
+DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
 # ── Debug flag — set True to verify pipeline on small subset ──────────────────
 # Runs 2 epochs on 50 samples, no multiprocessing, easier to debug errors.
 # Set --no-debug on command line for full training.
-DEBUG = False
+DEBUG = True
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 CONFIG = {
     # Data
     'batch_size':      2  if DEBUG else 4,
-    'num_workers':     0  if DEBUG else 0,
-    'pin_memory':      False,
-    'subset_size':     50 if DEBUG else None,   # None = full dataset
+    'num_workers':     0  if DEBUG else 4,
+    'pin_memory':      False if DEBUG else True,
+    'subset_size':     50 if DEBUG else None,
 
     # Training
-    'max_epochs':      2   if DEBUG else 1,
-    'early_stop_patience': 15,                  # epochs without val improvement
-    'grad_clip':       1.0,                     # max gradient norm
+    'max_epochs':      2   if DEBUG else 100,
+    'early_stop_patience': 15,
+    'grad_clip':       1.0,
 
     # Optimiser (AdamW)
     'lr':              1e-4,
     'weight_decay':    1e-4,
 
     # Scheduler (ReduceLROnPlateau)
-    'lr_patience':     5,     # epochs without improvement before reducing LR
-    'lr_factor':       0.5,   # multiply LR by this on plateau
-    'lr_min':          1e-6,  # floor
+    'lr_patience':     5,
+    'lr_factor':       0.5,
+    'lr_min':          1e-6,
 
     # Loss
-    'cls_weight':      0.1,   # weight on auxiliary fabric classification loss
+    'cls_weight':      0.1,
 
     # Model
     'embed_dim':       128,
     'latent_dim':      128,
-    'gnn_layers':      10,
+    'gnn_layers':      6,
 
     # Logging
-    'log_every':       10,    # log training loss every N batches
-    'use_wandb':       False, # set True on Vast.ai
+    'log_every':       10,
+    'use_wandb':       True,
     'experiment_name': 'method1_baseline',
 }
 
@@ -393,6 +399,8 @@ def load_checkpoint(path, model, optimiser, scheduler, device):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    torch.cuda.empty_cache()
+    gc.collect()
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-debug',  action='store_true',
                         help='Run full training (default: debug mode)')
@@ -446,19 +454,19 @@ def main():
 
     train_loader = DataLoader(
         train_ds,
-        batch_size  = cfg['batch_size'],
-        shuffle     = True,
-        num_workers = cfg['num_workers'],
-        pin_memory  = False,
-        persistent_workers = False
+        batch_size=cfg['batch_size'],
+        shuffle=True,
+        num_workers=cfg['num_workers'],
+        pin_memory=cfg['pin_memory'],
+        persistent_workers=cfg['num_workers'] > 0,
     )
     val_loader = DataLoader(
         val_ds,
-        batch_size  = cfg['batch_size'],
-        shuffle     = False,
-        num_workers = cfg['num_workers'],
-        pin_memory  = False,
-        persistent_workers = False, 
+        batch_size=cfg['batch_size'],
+        shuffle=False,
+        num_workers=cfg['num_workers'],
+        pin_memory=cfg['pin_memory'],
+        persistent_workers=cfg['num_workers'] > 0,
     )
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches:   {len(val_loader)}")

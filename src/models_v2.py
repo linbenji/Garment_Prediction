@@ -242,6 +242,9 @@ class HybridDrapeModel(nn.Module):
         # ── Step 1: ViT encodes image to style embedding ──────────────────────
         style_emb = self.vit(data.image)          # (B, 128)
 
+        # ── ABLATION TEST — comment this out after testing ────────────────────
+        style_emb = torch.zeros_like(style_emb)  # zero out ViT embedding
+
         # ── Step 2: Broadcast global conditioning to every node ───────────────
         # data.batch maps each node to its graph index in the batch.
         # PyG concatenates per-graph tensors into (B*dim,) during batching

@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch_geometric.loader import DataLoader
 from models import HybridDrapeModel
-from data_loader import CustomGarmentDataset
+from older_versions.data_loader import CustomGarmentDataset
 
 # -----------------------------------------
 # Custom Physics Loss Function
