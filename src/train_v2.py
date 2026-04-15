@@ -352,16 +352,17 @@ class Logger:
                 print("  wandb not installed — pip install wandb")
                 self.use_wandb = False
 
-    def log_train(self, step, loss, drape, cls, mve):
+    def log_train(self, step, loss, drape, cls, strain, mve):
         if self.tb_writer:
-            self.tb_writer.add_scalar('train/loss',       loss,  step)
-            self.tb_writer.add_scalar('train/drape_loss', drape, step)
-            self.tb_writer.add_scalar('train/cls_loss',   cls,   step)
-            self.tb_writer.add_scalar('train/mve_mm',     mve,   step)
+            self.tb_writer.add_scalar('train/loss',        loss,  step)
+            self.tb_writer.add_scalar('train/drape_loss',  drape, step)
+            self.tb_writer.add_scalar('train/cls_loss',    cls,   step)
+            self.tb_writer.add_scalar('train/strain_loss', strain, step)
+            self.tb_writer.add_scalar('train/mve_mm',      mve,   step)
         if self.use_wandb:
             import wandb
-            wandb.log({'train/loss': loss, 'train/drape': drape,
-                       'train/cls': cls,  'train/mve': mve, 'step': step})
+            wandb.log({'train/loss': loss, 'train/drape': drape, 'train/cls': cls,
+                       'train/strain': strain, 'train/mve': mve, 'step': step})
 
     def log_val(self, epoch, results, split='val'):
         if self.tb_writer:
