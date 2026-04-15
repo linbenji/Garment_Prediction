@@ -7,7 +7,7 @@ Computes:
   1. Overall MVE (mean vertex error in mm)
   2. Per-fabric-family MVE breakdown
   3. Per-size MVE breakdown
-  4. Generalisation condition breakdown (seen/unseen body × seen/unseen material)
+  4. Generalisation condition breakdown (seen/unseen body x seen/unseen material)
   5. Zero predictor baseline (predict zero displacement)
   6. Mean predictor baseline (predict training mean displacement per vertex)
   7. Saves predicted + ground truth meshes as .obj for visualisation
