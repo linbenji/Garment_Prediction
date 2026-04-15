@@ -1,8 +1,8 @@
 """
 train_v2.py
 
-Training loop for HybridDrapeModel (ViT + GNN garment drape prediction).
-Method 1 baseline: global conditioning via node feature concatenation.
+Training loop for HybridDrapeModel (ViT + GNN garment drape prediction)
+Method 1 baseline: global conditioning via node feature concatenation
 
 Usage:
     # Debug run (50 samples, 2 epochs — verify pipeline)
@@ -78,6 +78,7 @@ CONFIG = {
 
     # Loss
     'cls_weight':      0.1,
+    'strain_weight':   0.1,
 
     # Model
     'embed_dim':       128,
@@ -140,7 +141,7 @@ def per_condition_error(pred_delta, target_delta, batch, metadata):
 
 # ── Training step ─────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimiser, device, config, epoch, logger):
+def train_epoch(model, loader, optimiser, device, config, epoch, logger, amp_dtype, use_scaler, scaler):
     torch.cuda.empty_cache()
     model.train()
 
@@ -148,45 +149,53 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger):
     total_drape  = 0.0
     total_cls    = 0.0
     total_mve    = 0.0
+    total_strain = 0.0
     n_batches    = 0
     start_time   = time.time()
 
     for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
-
         optimiser.zero_grad()
 
-        predicted_delta, fabric_logits = model(batch)
+        # Run the forward pass in Mixed Precision (for computational efficiency)
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
+            predicted_delta, fabric_logits = model(batch)
 
-        loss, d_loss, c_loss = drape_loss(
-            predicted_delta,
-            batch.y,
-            batch.loss_weight,
-            fabric_logits,
-            batch.fabric_family_label,
-            cls_weight=config['cls_weight'],
-        )
+            loss, d_loss, e_loss, c_loss = drape_loss(
+                predicted_delta, batch.y, batch.pos, batch.edge_index, 
+                batch.loss_weight, fabric_logits, batch.fabric_family_label,
+                cls_weight=config['cls_weight'], strain_weight=config['strain_weight']
+            )
 
         # Check for NaN before backprop
         if torch.isnan(loss):
             print(f"  WARNING: NaN loss at epoch {epoch} batch {batch_idx} — skipping")
             continue
 
-        loss.backward()
-
-        # Gradient clipping — prevents exploding gradients in GNN
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), config['grad_clip'])
-
-        optimiser.step()
+        # Backward pass (conditional)
+        if use_scaler:
+            # Fallback for older GPUs (uses float16 + Scaler)
+            scaler.scale(loss).backward()
+            # Unscale the gradients before clipping so the threshold remains accurate
+            scaler.unscale_(optimiser)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+            # Step the optimizer and update the scaler
+            scaler.step(optimiser)
+            scaler.update()
+        else:
+            # Native path for A100 / RTX 5090 (uses bfloat16, no Scaler needed)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+            optimiser.step()
 
         mve = mean_vertex_error(predicted_delta.detach(), batch.y)
 
-        total_loss  += loss.item()
-        total_drape += d_loss.item()
-        total_cls   += c_loss.item()
-        total_mve   += mve
-        n_batches   += 1
+        total_loss   += loss.item()
+        total_drape  += d_loss.item()
+        total_cls    += c_loss.item()
+        total_strain += e_loss.item()
+        total_mve    += mve
+        n_batches    += 1
 
         # Per-batch logging
         if (batch_idx + 1) % config['log_every'] == 0:
@@ -200,17 +209,18 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger):
             if logger:
                 step = (epoch - 1) * len(loader) + batch_idx
                 logger.log_train(step, avg_loss, total_drape/n_batches,
-                                 total_cls/n_batches, avg_mve)
+                                 total_cls/n_batches, total_strain/n_batches, avg_mve)
 
     if n_batches == 0:
         return {'loss': float('nan'), 'drape': float('nan'),
-                'cls': float('nan'), 'mve': float('nan')}
+                'cls': float('nan'), 'strain': float('nan'), 'mve': float('nan')}
 
     return {
-        'loss':  total_loss  / n_batches,
-        'drape': total_drape / n_batches,
-        'cls':   total_cls   / n_batches,
-        'mve':   total_mve   / n_batches,
+        'loss':   total_loss   / n_batches,
+        'drape':  total_drape  / n_batches,
+        'cls':    total_cls    / n_batches,
+        'strain': total_strain / n_batches,
+        'mve':    total_mve    / n_batches,
     }
 
 
@@ -237,13 +247,16 @@ def val_epoch(model, loader, device, config, epoch, logger, split='val'):
 
         predicted_delta, fabric_logits = model(batch)
 
-        loss, d_loss, c_loss = drape_loss(
+        loss, d_loss, e_loss, c_loss = drape_loss(
             predicted_delta,
             batch.y,
+            batch.pos,
+            batch.edge_index,
             batch.loss_weight,
             fabric_logits,
             batch.fabric_family_label,
             cls_weight=config['cls_weight'],
+            strain_weight=config['strain_weight']
         )
 
         if torch.isnan(loss):
@@ -251,11 +264,12 @@ def val_epoch(model, loader, device, config, epoch, logger, split='val'):
 
         mve = mean_vertex_error(predicted_delta, batch.y)
 
-        total_loss  += loss.item()
-        total_drape += d_loss.item()
-        total_cls   += c_loss.item()
-        total_mve   += mve
-        n_batches   += 1
+        total_loss   += loss.item()
+        total_drape  += d_loss.item()
+        total_cls    += c_loss.item()
+        total_strain += e_loss.item()
+        total_mve    += mve
+        n_batches    += 1
 
         # Break down errors by generalisation condition
         # We access metadata from the batch using the batch index tensor
@@ -275,13 +289,15 @@ def val_epoch(model, loader, device, config, epoch, logger, split='val'):
                 seen_both_errs.append(err)
 
     if n_batches == 0:
-        return {'loss': float('nan'), 'mve': float('nan')}
+        return {'loss': float('nan'), 'drape': float('nan'),
+                'cls': float('nan'), 'strain': float('nan'), 'mve': float('nan')}
 
     results = {
-        'loss':  total_loss  / n_batches,
-        'drape': total_drape / n_batches,
-        'cls':   total_cls   / n_batches,
-        'mve':   total_mve   / n_batches,
+        'loss':   total_loss   / n_batches,
+        'drape':  total_drape  / n_batches,
+        'cls':    total_cls    / n_batches,
+        'strain': total_strain / n_batches,
+        'mve':    total_mve    / n_batches,
     }
 
     if heavy_woven_errs:
@@ -301,10 +317,10 @@ def val_epoch(model, loader, device, config, epoch, logger, split='val'):
 
 class Logger:
     """
-    Unified logger supporting TensorBoard (local) and wandb (cloud).
+    Unified logger supporting TensorBoard (local) and wandb (cloud)
     TensorBoard: open a terminal and run:
         tensorboard --logdir C:/Dev/Clothing_Project/runs
-    Then open http://localhost:6006 in your browser.
+    Then open http://localhost:6006 in browser
     """
 
     def __init__(self, run_dir, config, use_wandb=False):
@@ -430,6 +446,18 @@ def main():
     if device.type == 'cuda':
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
         print(f"VRAM:   {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        # Enable cuDNN benchmarking
+        torch.backends.cudnn.benchmark = True
+    
+    # Determine the best available mixed precision format
+    if device.type == 'cuda' and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        print("  Hardware supports bfloat16: Enabled (GradScaler disabled)")
+        use_scaler = False
+    else:
+        amp_dtype = torch.float16
+        print("  Hardware requires float16: Enabled (GradScaler enabled)")
+        use_scaler = True
 
     # ── Experiment directory ──────────────────────────────────────────────────
     exp_name  = cfg['experiment_name'] + ('_debug' if debug else '')
@@ -484,7 +512,7 @@ def main():
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen    = total - trainable
     print(f"  Parameters: {total:,} total  {trainable:,} trainable  "
-          f"{frozen:,} frozen (DINOv2)")
+          f"{frozen:,} frozen (ViT-Small)")
 
     # ── Optimiser & scheduler ─────────────────────────────────────────────────
     optimiser = AdamW(
@@ -526,12 +554,16 @@ def main():
 
     history = []
 
+    # Initialize the AMP Scaler (This prevents gradients from rounding down to zero when using 16-bit math)
+    # Only used for older GPUs
+    scaler = torch.amp.GradScaler('cuda')
+
     for epoch in range(start_epoch, cfg['max_epochs'] + 1):
         epoch_start = time.time()
 
         # ── Train ─────────────────────────────────────────────────────────────
         train_metrics = train_epoch(
-            model, train_loader, optimiser, device, cfg, epoch, logger)
+            model, train_loader, optimiser, device, cfg, epoch, logger, amp_dtype, use_scaler, scaler)
 
         # ── Validate ──────────────────────────────────────────────────────────
         val_metrics = val_epoch(

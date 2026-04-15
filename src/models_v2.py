@@ -1,7 +1,11 @@
 """
-models_v2.py
+models_v2.py (Baseline Model)
 
-HybridDrapeModel: ViT style encoder + MeshGraphNet drape predictor.
+Architecture:
+  StyleViT_B16   : Standard ViT-B/16 (frozen) -> projection head -> 128-dim style embedding
+  MeshGraphNet   : encode-process-decode with 10 message passing layers
+  Context Inject : Node Concatenation (Baseline Method)
+  Losses         : Position MSE + Edge Strain Physics Loss + Aux Classification
 
 Architecture:
   StyleViT_DINO  : DINOv2-Small (frozen) -> projection head -> 128-dim style embedding
@@ -28,6 +32,7 @@ Output:
   fabric_logits   : (B, 6)           -- fabric family classification (auxiliary)
 """
 
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,27 +83,24 @@ def build_mlp(in_dim, out_dim, hidden_dim=256):
     )
 
 
-# ── ViT style encoder ─────────────────────────────────────────────────────────
+# ── ViT style encoder (BASELINE: ViT-S/16) ─────────────────────────────────────────────────────────
 
-class StyleViT_DINO(nn.Module):
+class StyleViT_S16(nn.Module):
     """
-    Frozen DINOv2-Small backbone + trainable projection head.
+    Frozen standard ViT-S/16 backbone + trainable projection head
     Maps a 224x224 image to a 128-dim style embedding.
 
-    DINOv2-Small outputs a 384-dim CLS token.
+    ViT_S_16 outputs a 384-dim CLS token.
     The projection head compresses this to STYLE_DIM (128) dims.
 
-    The backbone is frozen -- only the projection head trains.
-    This is appropriate for lean-only training (1475 samples is too small
-    to fine-tune a ViT backbone without heavy regularisation).
-    Unfreeze the backbone when scaling to the full 4500-sample dataset.
+    The backbone is frozen -- only the projection head trains (better for small datasets)
     """
 
     def __init__(self, embed_dim=STYLE_DIM):
         super().__init__()
 
-        self.backbone = torch.hub.load(
-            'facebookresearch/dinov2', 'dinov2_vits14')
+        # Load ImageNet pre-trained ViT-Small using timm
+        self.backbone = timm.create_model('vit_small_patch16_224', pretrained=True)
 
         # Freeze all backbone parameters
         for param in self.backbone.parameters():
@@ -200,7 +202,7 @@ class HybridDrapeModel(nn.Module):
     ):
         super().__init__()
 
-        self.vit = StyleViT_DINO(embed_dim=embed_dim)
+        self.vit = StyleViT_S16(embed_dim=embed_dim)
 
         # Node encoder: 158 -> latent_dim
         self.node_encoder = build_mlp(NODE_IN_DIM, latent_dim)
@@ -243,7 +245,7 @@ class HybridDrapeModel(nn.Module):
         style_emb = self.vit(data.image)          # (B, 128)
 
         # ── ABLATION TEST — comment this out after testing ────────────────────
-        style_emb = torch.zeros_like(style_emb)  # zero out ViT embedding
+        # style_emb = torch.zeros_like(style_emb)  # zero out ViT embedding
 
         # ── Step 2: Broadcast global conditioning to every node ───────────────
         # data.batch maps each node to its graph index in the batch.
@@ -288,37 +290,68 @@ class HybridDrapeModel(nn.Module):
 
 # ── Loss function ─────────────────────────────────────────────────────────────
 
-def drape_loss(predicted_delta, target_delta, loss_weight, fabric_logits,
-               fabric_labels, cls_weight=0.1):
+def compute_edge_strain_loss(pred_pos, gt_pos, edge_index):
     """
-    Combined drape prediction loss + auxiliary classification loss.
+    Calculates the difference in edge lengths between the predicted mesh and ground truth
+    This acts as a structural physics penalty to prevent the fabric from melting/stretching
+    """
+    row, col = edge_index
+    
+    # Calculate lengths of edges in predicted mesh
+    pred_edge_lengths = torch.norm(pred_pos[row] - pred_pos[col], dim=1)
+    
+    # Calculate lengths of edges in ground truth mesh
+    gt_edge_lengths = torch.norm(gt_pos[row] - gt_pos[col], dim=1)
+    
+    return F.mse_loss(pred_edge_lengths, gt_edge_lengths)
+
+def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
+               fabric_logits, fabric_labels, cls_weight=0.1, strain_weight=0.1):
+    """
+    Combined drape prediction loss + structural strain + auxiliary classification loss.
 
     Args:
-        predicted_delta : (total_nodes, 3)  -- model output
+        predicted_delta : (total_nodes, 3)  -- model output (how far each vertex should move from the template)
         target_delta    : (total_nodes, 3)  -- ground truth displacement
+        template_pos    : (total_nodes, 3)  -- starting [X, Y, Z] coordinates of the template
+        edge_index      : (2, total_edges)  -- tells the strain loss which vertices are physically stitched together
         loss_weight     : (total_nodes,)    -- per-vertex weights
+                                               - usually higher for the hem/sleeves (which move a lot) and lower for the collar
         fabric_logits   : (B, 6)            -- fabric family predictions
         fabric_labels   : (B,)              -- ground truth fabric family labels
-        cls_weight      : float             -- weight on classification loss
-                                               (small so it is auxiliary only)
+        cls_weight      : float             -- weight on classification loss (small so it is auxiliary only)
+        strain_weight   : float             -- how strict the physics engine should be about fabric stretching
 
     Returns:
         total_loss  : scalar
         drape_loss  : scalar  (for logging)
         cls_loss    : scalar  (for logging)
+        edge_loss   : scalar  (for logging)
     """
-    # Per-vertex squared error summed over xyz
+
+    # 1. Absolute Position Loss (MSE)
+    # Calculates the physical distance between where the network placed the vertex 
+    # and where it belongs, scaled by the vertex's importance weight
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)  # (total_nodes,)
-
     # Weighted mean
-    d_loss = (sq_err * loss_weight).mean() / 14117 # Normalized by vertex count 
+    d_loss = (sq_err * loss_weight).mean() # Normalized by vertex count
 
-    # Auxiliary classification loss
+    # 2. Edge Strain Loss (Physics structure)
+    # Reconstruct the absolute XYZ positions to calculate the distance between connected vertices
+    # If the predicted distance is too far from the ground truth, the network is punished for "stretching" or "shrinking" the fabric
+    pred_pos = template_pos + predicted_delta
+    gt_pos = template_pos + target_delta
+    e_loss = compute_edge_strain_loss(pred_pos, gt_pos, edge_index)
+
+    # 3. Auxiliary classification loss
+    # Punishes the ViT if it fails to recognize the correct fabric type from the image.
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
-    total = d_loss + cls_weight * c_loss
+    # Combine losses
+    total = d_loss + (strain_weight * e_loss) + (cls_weight * c_loss)
 
-    return total, d_loss, c_loss
+    # Return total (for the optimizer) and the individual components (for the logger)
+    return total, d_loss, e_loss, c_loss
 
 
 # ── Parameter count helper ────────────────────────────────────────────────────
@@ -330,7 +363,7 @@ def count_parameters(model):
     print(f"Parameters:")
     print(f"  Total:     {total:>12,}")
     print(f"  Trainable: {trainable:>12,}")
-    print(f"  Frozen:    {frozen:>12,}  (DINOv2 backbone)")
+    print(f"  Frozen:    {frozen:>12,}  (ViT_S_16 backbone)")
     return trainable
 
 
@@ -349,25 +382,23 @@ if __name__ == '__main__':
           f"style={STYLE_DIM} + smpl={SMPL_DIM} + "
           f"physics={PHYSICS_DIM} + size={SIZE_DIM})")
 
-    # Build model (skip DINOv2 download in smoke test)
-    print("\nBuilding model (skipping DINOv2 download)...")
+    # Build model (skip ViT download in smoke test)
+    print("\nBuilding model (skipping ViT download)...")
 
     class DummyViT(nn.Module):
-        """Stands in for StyleViT_DINO during smoke test."""
+        """Stands in for StyleViT_S16 during smoke test."""
         def forward(self, x):
             return torch.zeros(x.shape[0], STYLE_DIM)
 
-    # Patch HybridDrapeModel to use DummyViT so DINOv2 is never downloaded
+    # Patch HybridDrapeModel to use DummyViT so ViT_S_16 is never downloaded
     class HybridDrapeModelTest(HybridDrapeModel):
         def __init__(self):
-            # Call nn.Module.__init__ directly to skip StyleViT_DINO init
+            # Call nn.Module.__init__ directly to skip ViT init
             nn.Module.__init__(self)
             self.vit              = DummyViT()
             self.node_encoder     = build_mlp(NODE_IN_DIM, LATENT_DIM)
             self.edge_encoder     = build_mlp(EDGE_IN_DIM, LATENT_DIM)
-            self.processor        = nn.ModuleList([
-                MeshBlock(LATENT_DIM) for _ in range(GNN_LAYERS)
-            ])
+            self.processor        = nn.ModuleList([MeshBlock(LATENT_DIM) for _ in range(GNN_LAYERS)])
             self.decoder          = nn.Linear(LATENT_DIM, 3)
             self.fabric_classifier = nn.Linear(STYLE_DIM, NUM_FABRIC_FAMILIES)
 
@@ -408,7 +439,7 @@ if __name__ == '__main__':
     print(f"  Total nodes: {batch.pos.shape[0]}")
     print(f"  Total edges: {batch.edge_attr.shape[0]}")
 
-    # Manual forward (bypassing DINOv2)
+    # Manual forward
     style_emb    = torch.zeros(B, STYLE_DIM)
     b            = batch.batch
     node_style   = style_emb[b]
@@ -419,8 +450,7 @@ if __name__ == '__main__':
                    node_style, node_smpl, node_physics, node_size], dim=-1)
 
     print(f"\nNode feature vector: {x.shape}  (expected (total_nodes, {NODE_IN_DIM}))")
-    assert x.shape[1] == NODE_IN_DIM, \
-        f"Node feature dim mismatch: {x.shape[1]} != {NODE_IN_DIM}"
+    assert x.shape[1] == NODE_IN_DIM, f"Node feature dim mismatch: {x.shape[1]} != {NODE_IN_DIM}"
 
     x         = model.node_encoder(x)
     edge_attr = model.edge_encoder(batch.edge_attr)
@@ -434,8 +464,8 @@ if __name__ == '__main__':
     # Loss
     fabric_logits = torch.zeros(B, NUM_FABRIC_FAMILIES)
     fabric_labels = batch.fabric_family_label
-    total, d, c   = drape_loss(delta, batch.y, batch.loss_weight,
-                               fabric_logits, fabric_labels)
-    print(f"\nLoss:  total={total:.4f}  drape={d:.4f}  cls={c:.4f}")
+    total, d, e, c = drape_loss(delta, batch.y, batch.pos, batch.edge_index,
+                                batch.loss_weight, fabric_logits, fabric_labels)
+    print(f"\nLoss:  total={total:.4f}  drape={d:.4f}  strain={e:.4f}  cls={c:.4f}")
 
     print("\nSmoke test passed")

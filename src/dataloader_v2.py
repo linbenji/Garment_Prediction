@@ -8,15 +8,15 @@ Data flow:
   GNN  : template mesh + style embedding + SMPL + physics + size -> delta-v
   Loss : MSE(predicted delta-v, gt delta-v) weighted by per_vertex_std
 
-Lean-only training (1475 samples).
-Jersey medium excluded (is_baseline == 1) -- zero displacement, not a training target.
-Jersey medium images are still valid ViT inputs via _sample_input_row.
+Lean-only training (only lean poses)
+Jersey templates excluded (is_baseline == 1) -- zero displacement, not a training target
+Template images are still valid ViT inputs via _sample_input_row.
 
 Expected directory layout:
   root_dir/
     dataset_index.csv      # single CSV, one row per sample
     per_vertex_std.npy     # (14117,) per-vertex loss weights
-    meshes/                # 1475 .pt files, one per trainable sample
+    meshes/                # 1495 .pt files, one per trainable sample
     images/                # 72,000 flat .png files
     template/              # edge_index.npy, uvs.npy, faces.npy
       per_body_pose/       # 75 baseline .npy files
@@ -156,6 +156,13 @@ class GarmentDataset(Dataset):
         color        = random.choice(COLOR_VARIANTS)
         image_tensor = self._load_image(
             input_row['base_image_name'], angle, color)
+        
+        # Extract the input state for the ViT
+        in_smpl = torch.tensor(
+            json.loads(input_row['smpl_betas']), dtype=torch.float32)
+        in_size = torch.tensor(
+            SIZE_ENCODING[input_row['garment_size']], dtype=torch.float32)
+        in_physics = self._get_physics(input_row)
 
         return Data(
             # Graph structure
@@ -177,8 +184,11 @@ class GarmentDataset(Dataset):
             tgt_physics = tgt_physics,          # (10,)
             tgt_size    = tgt_size,             # (2,)
 
-            # ViT input
-            image = image_tensor.unsqueeze(0),               # (1, 3, 224, 224)
+            # ViT input (Image + Context)
+            image      = image_tensor.unsqueeze(0), # (1, 3, 224, 224)
+            in_smpl    = in_smpl,
+            in_size    = in_size,
+            in_physics = in_physics,
 
             # Labels
             fabric_family_label = torch.tensor(
