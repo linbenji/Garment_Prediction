@@ -91,14 +91,19 @@ class GarmentDataset(Dataset):
         self.df = df
         print(f"[GarmentDataset:{split}] {len(self.df)} trainable samples")
 
-        # Per-vertex loss weights
-        std_path = os.path.join(root_dir, 'per_vertex_std.npy')
-        if os.path.exists(std_path):
-            raw = np.load(std_path).astype(np.float32)
-            self.vert_weights = torch.from_numpy(raw / raw.mean())
-        else:
-            print("  WARNING: per_vertex_std.npy not found -- uniform weights")
-            self.vert_weights = torch.ones(14117, dtype=torch.float32)
+        # Pre-load the 5 size templates into RAM
+        self.size_templates = {}
+        expected_sizes = ['small', 'medium', 'large', 'xl', 'xxl']
+        
+        for size in expected_sizes:
+            # Matches the exact naming convention: body000_lean_jersey_small.pt
+            file_name = f"body000_lean_jersey_{size}.pt"
+            t_path = os.path.join(root_dir, 'template_sizes', file_name)
+            
+            if os.path.exists(t_path):
+                self.size_templates[size] = torch.load(t_path, weights_only=True)
+            else:
+                print(f"  WARNING: Missing template for {size} at {t_path}")
 
         # Full split df (including baselines) for ViT image sampling
         full_df = pd.read_csv(csv_path)
@@ -142,6 +147,10 @@ class GarmentDataset(Dataset):
             self.root_dir, 'meshes', f"{row['sample_name']}.pt")
         mesh = torch.load(pt_path, weights_only=True)
 
+        # Grab the correct base geometry for this shirt size
+        size_str = row['garment_size']
+        template = self.size_templates[size_str]
+
         # Target conditioning
         tgt_smpl    = torch.tensor(
             json.loads(row['smpl_betas']), dtype=torch.float32)       # (10,)
@@ -166,13 +175,13 @@ class GarmentDataset(Dataset):
 
         return Data(
             # Graph structure
-            pos        = mesh['pos'],           # (14117, 3)
-            edge_index = mesh['edge_index'],    # (2, 82988)
-            edge_attr  = mesh['edge_attr'],     # (82988, 4)
+            pos        = template['pos'],           # (14117, 3)
+            edge_index = template['edge_index'],    # (2, 82988)
+            edge_attr  = template['edge_attr'],     # (82988, 4)
 
             # Node features
-            uvs     = mesh['uvs'],              # (14117, 2)
-            normals = mesh['normals'],          # (14117, 3)
+            uvs     = template['uvs'],              # (14117, 2)
+            normals = template['normals'],          # (14117, 3)
 
             # Target
             y           = mesh['displacement'], # (14117, 3)  delta-v
