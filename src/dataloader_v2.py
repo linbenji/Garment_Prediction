@@ -96,7 +96,7 @@ class GarmentDataset(Dataset):
         expected_sizes = ['small', 'medium', 'large', 'xl', 'xxl']
         
         for size in expected_sizes:
-            # Matches the exact naming convention: body000_lean_jersey_small.pt
+            # Matches the exact naming convention: body000_lean_jersey_small.npy
             file_name = f"body000_lean_jersey_{size}.npy"
             t_path = os.path.join(root_dir, 'template_sizes', file_name)
             if os.path.exists(t_path):
@@ -147,9 +147,9 @@ class GarmentDataset(Dataset):
             self.root_dir, 'meshes', f"{row['sample_name']}.pt")
         mesh = torch.load(pt_path, weights_only=True)
 
-        # Grab the correct base geometry for this shirt size
+        # Grab the correct base geometry for this shirt size (positions ONLY) from the .npy template
         size_str = row['garment_size']
-        template = self.size_templates[size_str]
+        template_pos = self.size_templates[size_str] # (14117, 3)
 
         # Target conditioning
         tgt_smpl    = torch.tensor(
@@ -174,14 +174,14 @@ class GarmentDataset(Dataset):
         in_physics = self._get_physics(input_row)
 
         return Data(
-            # Graph structure
-            pos        = template['pos'],           # (14117, 3)
-            edge_index = template['edge_index'],    # (2, 82988)
-            edge_attr  = template['edge_attr'],     # (82988, 4)
-
+            # Base coordinates come from the size template
+            pos        = template_pos,           # (14117, 3)
+            # Graph structure and features come from the .pt mesh
+            edge_index = mesh['edge_index'],        # (2, 82988)
+            edge_attr  = mesh['edge_attr'],         # (82988, 4)
             # Node features
-            uvs     = template['uvs'],              # (14117, 2)
-            normals = template['normals'],          # (14117, 3)
+            uvs        = mesh['uvs'],               # (14117, 2)
+            normals    = mesh['normals'],           # (14117, 3)
 
             # Target
             y           = mesh['displacement'], # (14117, 3)  delta-v
