@@ -45,8 +45,11 @@ from models_v3 import MasterDrapeModel, AutomaticLossWeighter, drape_loss
 #DATA_ROOT = '/workspace/batch_1500_lean'
 #RUNS_DIR  = '/workspace/runs'
 
-DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
-RUNS_DIR   = r"/Users/Ben/Desktop/runs"
+#DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+#RUNS_DIR   = r"/Users/Ben/Desktop/runs"
+
+DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
+RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
 
 # ── Debug flag — set True to verify pipeline on small subset ──────────────────
 # Runs 2 epochs on 50 samples, no multiprocessing, easier to debug errors.
@@ -239,6 +242,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter, split
     total_drape = 0.0
     total_cls   = 0.0
     total_mve   = 0.0
+    total_strain = 0.0
     n_batches   = 0
 
     # Track errors by generalisation condition

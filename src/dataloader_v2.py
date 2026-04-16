@@ -277,7 +277,7 @@ if __name__ == '__main__':
 
     # ── Per-split sample count verification ──────────────────────────────────
     print("── Split counts ──")
-    EXPECTED = {'train': 1127, 'val': 168, 'test': 180}
+    EXPECTED = {'train': 1145, 'val': 170, 'test': 180}
     datasets  = {}
     all_ok    = True
     for split, expected in EXPECTED.items():

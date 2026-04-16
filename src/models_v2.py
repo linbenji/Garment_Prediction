@@ -122,8 +122,9 @@ class StyleViT_S16(nn.Module):
             style_code: (B, embed_dim)
         """
         with torch.no_grad():
-            features = self.backbone(images)   # (B, 384) CLS token
-        return self.projection_head(features)  # (B, embed_dim)
+            features = self.backbone.forward_features(images)  # (B, 197, 384) — patch tokens + CLS
+            features = features[:, 0]                          # (B, 384) — CLS token only
+        return self.projection_head(features)                  # (B, embed_dim)
 
 
 # ── Message passing block ─────────────────────────────────────────────────────
