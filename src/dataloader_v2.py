@@ -148,7 +148,7 @@ class GarmentDataset(Dataset):
 
         # Grab the correct base geometry for this shirt size
         size_str = row['garment_size']
-        template = self.size_templates[size_str]
+        pos = self.size_templates[size_str]
 
         # Target conditioning
         tgt_smpl    = torch.tensor(
