@@ -1,5 +1,5 @@
 """
-predict_final.py
+predict_v3.py
 
 Single-sample inference for MasterDrapeModel
 Given a fabric type, body shape, size, and a reference image, predicts the draped shirt mesh and saves it as a .obj file
