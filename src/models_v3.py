@@ -5,7 +5,7 @@ MasterDrapeModel: DINOv2 (Frozen) + FiLM-Modulated MeshGraphNet + Physics Triad 
 Architecture:
   StyleViT_DINO  : DINOv2-Small (frozen) -> projection head -> 128-dim style
   Context Inject : MLP -> FiLM (Feature-wise Linear Modulation) [Scale & Shift]
-  MeshGraphNet   : encode-process-decode (10 layers) with FiLM residuals
+  MeshGraphNet   : encode-process-decode with FiLM residuals (defaults to 10 layers, overridden to 6 in train_v3.py config)
   Losses         : Position MSE + Edge Strain + SMPL Collision Penalty (currently disabled) + Aux Cls
 """
 
@@ -27,7 +27,7 @@ SIZE_DIM         = 2
 
 EDGE_IN_DIM  = 4    
 LATENT_DIM   = 128
-GNN_LAYERS   = 10
+GNN_LAYERS   = 10 # (defaults to 10 layers, overridden to 6 in train_v3.py config)
 
 NUM_FABRIC_FAMILIES = 6
 
@@ -253,6 +253,9 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
 def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
                fabric_logits, fabric_labels, body_pos=None, body_normals=None,
                cls_weight=0.1, strain_weight=0.1, collision_weight=1.0):
+    """
+    Note: When using AutomaticLossWeighter, cls_weight and strain_weight are passed as 1.0, and dynamic scaling is handled externally
+    """
     
     # 1. Drape (Position MSE)
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)

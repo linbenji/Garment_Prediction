@@ -2,15 +2,10 @@
 models_v2.py (Baseline Model)
 
 Architecture:
-  StyleViT_B16   : Standard ViT-B/16 (frozen) -> projection head -> 128-dim style embedding
+  StyleViT_S16   : Standard ViT-S/16 (frozen) -> projection head -> 128-dim style embedding
   MeshGraphNet   : encode-process-decode with 10 message passing layers
   Context Inject : Node Concatenation (Baseline Method)
   Losses         : Position MSE + Edge Strain Physics Loss + Aux Classification
-
-Architecture:
-  StyleViT_DINO  : DINOv2-Small (frozen) -> projection head -> 128-dim style embedding
-  MeshGraphNet   : encode-process-decode with 10 message passing layers
-  HybridDrapeModel: wrapper that connects both and defines the training forward pass
 
 Node feature vector (per vertex, 158-dim total):
   pos      (3)   -- template vertex XYZ position
@@ -52,6 +47,7 @@ POSE_DIM         = 72   # included for future multi-pose support
 
 EDGE_IN_DIM  = 4    # [dx, dy, dz, length]
 LATENT_DIM   = 128
+# MeshGraphNet : encode-process-decode (Defaults to 10 layers, overridden to 6 in config)
 GNN_LAYERS   = 10
 
 NUM_FABRIC_FAMILIES = 6
@@ -190,9 +186,10 @@ class HybridDrapeModel(nn.Module):
       7. Auxiliary classifier outputs (B, 6) fabric family logits
 
     Loss (computed in training loop):
-      drape_loss = (MSE(predicted_delta, y) * loss_weight).mean()
-      cls_loss   = CrossEntropy(fabric_logits, fabric_family_label)
-      total_loss = drape_loss + cls_weight * cls_loss
+      drape_loss  = (MSE(predicted_delta, y) * loss_weight).mean()
+      cls_loss    = CrossEntropy(fabric_logits, fabric_family_label)
+      strain_loss = MSE(pred_edge_lengths, gt_edge_lengths)
+      total_loss  = drape_loss + cls_weight * cls_loss + strain_weight * strain_loss
     """
 
     def __init__(

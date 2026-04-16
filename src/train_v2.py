@@ -6,13 +6,13 @@ Method 1 baseline: global conditioning via node feature concatenation
 
 Usage:
     # Debug run (50 samples, 2 epochs — verify pipeline)
-    python train.py
+    python train_v2.py
 
     # Full training run
-    python train.py --no-debug
+    python train_v2.py --no-debug
 
     # Resume from checkpoint
-    python train.py --no-debug --resume runs/exp_001/best.pt
+    python train_v2.py --no-debug --resume runs/exp_001/best.pt
 """
 
 import os

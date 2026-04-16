@@ -1,18 +1,18 @@
 """
-train_v2.py
+train_v3.py
 
 Training loop for MasterDrapeModel (DINO + GNN garment drape prediction)
 Method 2 final: DINOv2 + FiLM-Modulated MeshGraphNet
 
 Usage:
     # Debug run (50 samples, 2 epochs — verify pipeline)
-    python train.py
+    python train_v3.py
 
     # Full training run
-    python train.py --no-debug
+    python train_v3.py --no-debug
 
     # Resume from checkpoint
-    python train.py --no-debug --resume runs/exp_001/best.pt
+    python train_v3.py --no-debug --resume runs/exp_001/best.pt
 """
 
 import os
@@ -79,10 +79,6 @@ CONFIG = {
     'lr_factor':       0.5,
     'lr_min':          1e-6,
 
-    # Loss
-    'cls_weight':      0.1,
-    'strain_weight':   0.1,
-
     # Model
     'embed_dim':       128,
     'latent_dim':      128,
@@ -91,7 +87,7 @@ CONFIG = {
     # Logging
     'log_every':       10,
     'use_wandb':       True,
-    'experiment_name': 'method1_baseline',
+    'experiment_name': 'method2_master',
 }
 
 
@@ -529,7 +525,7 @@ def main():
     optimiser = AdamW([
         {'params': filter(lambda p: p.requires_grad, model.parameters())},
         {'params': loss_weighter.parameters(), 'weight_decay': 0.0} # No weight decay on loss params
-    ], lr=cfg['lr'])
+    ], lr=cfg['lr'], weight_decay=cfg['weight_decay'])
     scheduler = ReduceLROnPlateau(
         optimiser,
         mode     = 'min',
