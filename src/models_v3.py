@@ -117,6 +117,42 @@ class FiLMMeshBlock(MessagePassing):
 
     def message(self, edge_attr):
         return edge_attr
+    
+
+class AutomaticLossWeighter(nn.Module):
+    '''
+    Find the perfect balance between the loss terms to maintain balance
+    - Drape loss, edge strain loss, and classification loss are all scaled based on their values
+    - Does not allow a single loss term to dominate during training
+    - Can set priority values to assign priority between the loss terms
+    '''
+    def __init__(self, num_tasks=3, priors=None):
+        super().__init__()
+        # Initialize log(sigma^2) to 0. 
+        # Use log variance for numerical stability (prevents division by zero)
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
+
+        # If no priors are provided, default to equal importance (1.0)
+        if priors is None:
+            priors = [1.0] * num_tasks
+        # Store the priors as a buffer so they move to the GPU with the model, but the optimizer knows NOT to train them
+        self.register_buffer('priors', torch.tensor(priors, dtype=torch.float32))
+
+    def forward(self, d_loss, e_loss, c_loss):
+        # Gather the raw losses
+        losses = [d_loss, e_loss, c_loss]
+        total_loss = 0
+        
+        for i, loss in enumerate(losses):
+            # Calculate precision: exp(-log(sigma^2)) = 1 / sigma^2
+            precision = torch.exp(-self.log_vars[i])
+            
+            # Apply the uncertainty weighting formula
+            task_loss = (precision * loss) + self.log_vars[i]
+            # Multiply the dynamically balanced loss by the static priority weight
+            total_loss += self.priors[i] * task_loss
+            
+        return total_loss
 
 
 # ── Final Master Architecture ────────────────────────────────────────────────

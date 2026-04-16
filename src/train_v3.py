@@ -38,7 +38,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v3 import MasterDrapeModel, drape_loss
+from models_v3 import MasterDrapeModel, AutomaticLossWeighter, drape_loss
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -141,7 +141,7 @@ def per_condition_error(pred_delta, target_delta, batch, metadata):
 
 # ── Training step ─────────────────────────────────────────────────────────────
 
-def train_epoch(model, loader, optimiser, device, config, epoch, logger, amp_dtype, use_scaler, scaler):
+def train_epoch(model, loader, optimiser, device, config, epoch, logger, amp_dtype, use_scaler, scaler, loss_weighter):
     torch.cuda.empty_cache()
     model.train()
 
@@ -161,11 +161,15 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger, amp_dty
         with torch.amp.autocast('cuda', dtype=amp_dtype):
             predicted_delta, fabric_logits = model(batch)
 
-            loss, d_loss, e_loss, c_loss = drape_loss(
+            # Get the raw unweighted losses
+            _, d_loss, e_loss, col_loss, c_loss = drape_loss(
                 predicted_delta, batch.y, batch.pos, batch.edge_index, 
                 batch.loss_weight, fabric_logits, batch.fabric_family_label,
-                cls_weight=config['cls_weight'], strain_weight=config['strain_weight']
+                cls_weight=1.0, strain_weight=1.0 # Set to 1.0 so they are raw values
             )
+
+            # Let the AutomaticWeighter calculate the total loss
+            loss = loss_weighter(d_loss, e_loss, c_loss)
 
         # Check for NaN before backprop
         if torch.isnan(loss):
@@ -227,7 +231,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger, amp_dty
 # ── Validation step ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def val_epoch(model, loader, device, config, epoch, logger, split='val'):
+def val_epoch(model, loader, device, config, epoch, logger, loss_weighter, split='val'):
     torch.cuda.empty_cache()
     model.eval()
 
@@ -247,17 +251,15 @@ def val_epoch(model, loader, device, config, epoch, logger, split='val'):
 
         predicted_delta, fabric_logits = model(batch)
 
-        loss, d_loss, e_loss, c_loss = drape_loss(
-            predicted_delta,
-            batch.y,
-            batch.pos,
-            batch.edge_index,
-            batch.loss_weight,
-            fabric_logits,
-            batch.fabric_family_label,
-            cls_weight=config['cls_weight'],
-            strain_weight=config['strain_weight']
+        # Get the raw unweighted losses
+        _, d_loss, e_loss, col_loss, c_loss = drape_loss(
+            predicted_delta, batch.y, batch.pos, batch.edge_index, 
+            batch.loss_weight, fabric_logits, batch.fabric_family_label,
+            cls_weight=1.0, strain_weight=1.0 # Set to 1.0 so they are raw values
         )
+
+        # Let the AutomaticWeighter calculate the total loss
+        loss = loss_weighter(d_loss, e_loss, c_loss)
 
         if torch.isnan(loss):
             continue
@@ -352,16 +354,17 @@ class Logger:
                 print("  wandb not installed — pip install wandb")
                 self.use_wandb = False
 
-    def log_train(self, step, loss, drape, cls, mve):
+    def log_train(self, step, loss, drape, cls, strain, mve):
         if self.tb_writer:
-            self.tb_writer.add_scalar('train/loss',       loss,  step)
-            self.tb_writer.add_scalar('train/drape_loss', drape, step)
-            self.tb_writer.add_scalar('train/cls_loss',   cls,   step)
-            self.tb_writer.add_scalar('train/mve_mm',     mve,   step)
+            self.tb_writer.add_scalar('train/loss',        loss,  step)
+            self.tb_writer.add_scalar('train/drape_loss',  drape, step)
+            self.tb_writer.add_scalar('train/cls_loss',    cls,   step)
+            self.tb_writer.add_scalar('train/strain_loss', strain, step)
+            self.tb_writer.add_scalar('train/mve_mm',      mve,   step)
         if self.use_wandb:
             import wandb
-            wandb.log({'train/loss': loss, 'train/drape': drape,
-                       'train/cls': cls,  'train/mve': mve, 'step': step})
+            wandb.log({'train/loss': loss, 'train/drape': drape, 'train/cls': cls,
+                       'train/strain': strain, 'train/mve': mve, 'step': step})
 
     def log_val(self, epoch, results, split='val'):
         if self.tb_writer:
@@ -507,19 +510,22 @@ def main():
         gnn_layers = cfg['gnn_layers'],
     ).to(device)
 
+    # Set the priorities: [Drape, Strain, Classification]
+    # e.g. Drape is 100% priority, Strain is a 20% penalty, and Classification is a 10% nudge
+    loss_weighter = AutomaticLossWeighter(num_tasks=3, priors=[1.0, 0.2, 0.1]).to(device)
+
     # Count parameters
     total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen    = total - trainable
     print(f"  Parameters: {total:,} total  {trainable:,} trainable  "
-          f"{frozen:,} frozen (ViT-Small)")
+          f"{frozen:,} frozen (DINOv2)")
 
-    # ── Optimiser & scheduler ─────────────────────────────────────────────────
-    optimiser = AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr           = cfg['lr'],
-        weight_decay = cfg['weight_decay'],
-    )
+    # ── Optimiser & Scheduler ─────────────────────────────────────────────────
+    optimiser = AdamW([
+        {'params': filter(lambda p: p.requires_grad, model.parameters())},
+        {'params': loss_weighter.parameters(), 'weight_decay': 0.0} # No weight decay on loss params
+    ], lr=cfg['lr'])
     scheduler = ReduceLROnPlateau(
         optimiser,
         mode     = 'min',
@@ -563,11 +569,11 @@ def main():
 
         # ── Train ─────────────────────────────────────────────────────────────
         train_metrics = train_epoch(
-            model, train_loader, optimiser, device, cfg, epoch, logger, amp_dtype, use_scaler, scaler)
+            model, train_loader, optimiser, device, cfg, epoch, logger, amp_dtype, use_scaler, scaler, loss_weighter)
 
         # ── Validate ──────────────────────────────────────────────────────────
         val_metrics = val_epoch(
-            model, val_loader, device, cfg, epoch, logger, split='val')
+            model, val_loader, device, cfg, epoch, logger, loss_weighter, split='val')
 
         # ── Scheduler step ────────────────────────────────────────────────────
         scheduler.step(val_metrics['loss'])
