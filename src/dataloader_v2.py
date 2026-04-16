@@ -97,11 +97,10 @@ class GarmentDataset(Dataset):
         
         for size in expected_sizes:
             # Matches the exact naming convention: body000_lean_jersey_small.pt
-            file_name = f"body000_lean_jersey_{size}.pt"
+            file_name = f"body000_lean_jersey_{size}.npy"
             t_path = os.path.join(root_dir, 'template_sizes', file_name)
-            
-            if os.path.exists(t_path):
-                self.size_templates[size] = torch.load(t_path, weights_only=True)
+            verts = np.load(t_path).astype(np.float32)
+            self.size_templates[size] = torch.from_numpy(verts)  # (14117, 3)
             else:
                 print(f"  WARNING: Missing template for {size} at {t_path}")
 
