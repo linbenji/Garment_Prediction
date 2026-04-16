@@ -99,8 +99,9 @@ class GarmentDataset(Dataset):
             # Matches the exact naming convention: body000_lean_jersey_small.pt
             file_name = f"body000_lean_jersey_{size}.npy"
             t_path = os.path.join(root_dir, 'template_sizes', file_name)
-            verts = np.load(t_path).astype(np.float32)
-            self.size_templates[size] = torch.from_numpy(verts)  # (14117, 3)
+            if os.path.exists(t_path):
+                verts = np.load(t_path).astype(np.float32)
+                self.size_templates[size] = torch.from_numpy(verts)  # (14117, 3)
             else:
                 print(f"  WARNING: Missing template for {size} at {t_path}")
 
@@ -148,7 +149,7 @@ class GarmentDataset(Dataset):
 
         # Grab the correct base geometry for this shirt size
         size_str = row['garment_size']
-        pos = self.size_templates[size_str]
+        template = self.size_templates[size_str]
 
         # Target conditioning
         tgt_smpl    = torch.tensor(
