@@ -27,7 +27,6 @@ SIZE_DIM         = 2
 
 EDGE_IN_DIM  = 4    
 LATENT_DIM   = 128
-GNN_LAYERS   = 10 # (defaults to 10 layers, overridden to 6 in train_v3.py config)
 
 NUM_FABRIC_FAMILIES = 6
 
@@ -158,7 +157,7 @@ class AutomaticLossWeighter(nn.Module):
 # ── Final Master Architecture ────────────────────────────────────────────────
 
 class MasterDrapeModel(nn.Module):
-    def __init__(self, embed_dim=STYLE_DIM, latent_dim=LATENT_DIM, gnn_layers=GNN_LAYERS):
+    def __init__(self, gnn_layers, embed_dim=STYLE_DIM, latent_dim=LATENT_DIM):
         super().__init__()
 
         self.vit = StyleViT_DINO(embed_dim=embed_dim)

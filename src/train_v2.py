@@ -507,9 +507,9 @@ def main():
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nBuilding model...")
     model = HybridDrapeModel(
+        gnn_layers = cfg['gnn_layers'],
         embed_dim  = cfg['embed_dim'],
         latent_dim = cfg['latent_dim'],
-        gnn_layers = cfg['gnn_layers'],
     ).to(device)
 
     # Count parameters

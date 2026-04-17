@@ -47,8 +47,6 @@ POSE_DIM         = 72   # included for future multi-pose support
 
 EDGE_IN_DIM  = 4    # [dx, dy, dz, length]
 LATENT_DIM   = 128
-# MeshGraphNet : encode-process-decode (Defaults to 10 layers, overridden to 6 in config)
-GNN_LAYERS   = 10
 
 NUM_FABRIC_FAMILIES = 6
 NUM_FABRIC_PRESETS  = 12
@@ -194,9 +192,9 @@ class HybridDrapeModel(nn.Module):
 
     def __init__(
         self,
+        gnn_layers,
         embed_dim  = STYLE_DIM,
         latent_dim = LATENT_DIM,
-        gnn_layers = GNN_LAYERS,
     ):
         super().__init__()
 
