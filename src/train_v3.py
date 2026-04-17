@@ -42,32 +42,32 @@ from models_v3 import MasterDrapeModel, AutomaticLossWeighter, drape_loss
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#DATA_ROOT = '/workspace/batch_1500_lean'
-#RUNS_DIR  = '/workspace/runs'
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
 #DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
 #RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
-DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
-RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
+#DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
+#RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
 
 # ── Debug flag — set True to verify pipeline on small subset ──────────────────
 # Runs 2 epochs on 50 samples, no multiprocessing, easier to debug errors.
 # Set --no-debug on command line for full training.
-DEBUG = True
+DEBUG = False
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 CONFIG = {
     # Data
-    'batch_size':      2  if DEBUG else 4,
+    'batch_size':      2  if DEBUG else 8,
     'num_workers':     0  if DEBUG else 4,
     'pin_memory':      False if DEBUG else True,
     'subset_size':     50 if DEBUG else None,
 
     # Training
-    'max_epochs':      2   if DEBUG else 100,
-    'early_stop_patience': 15,
+    'max_epochs':      2   if DEBUG else 150,
+    'early_stop_patience': 25,
     'grad_clip':       1.0,
 
     # Optimiser (AdamW)
@@ -75,9 +75,9 @@ CONFIG = {
     'weight_decay':    1e-4,
 
     # Scheduler (ReduceLROnPlateau)
-    'lr_patience':     5,
+    'lr_patience':     8,
     'lr_factor':       0.5,
-    'lr_min':          1e-6,
+    'lr_min':          1e-7,
 
     # Model
     'embed_dim':       128,

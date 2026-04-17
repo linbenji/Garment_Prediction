@@ -1,5 +1,5 @@
 """
-eval_final.py
+eval_v3.py
 
 Evaluation script for MasterDrapeModel checkpoints.
 
@@ -14,13 +14,13 @@ Computes:
 
 Usage:
     # Evaluate best checkpoint on test split
-    python eval_final.py --checkpoint runs/method1_baseline/checkpoints/best.pt
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt
 
     # Evaluate on val split
-    python eval_final.py --checkpoint runs/method1_baseline/checkpoints/best.pt --split val
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --split val
 
     # Evaluate and save meshes for visualisation
-    python eval_final.py --checkpoint runs/method1_baseline/checkpoints/best.pt --save-meshes
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --save-meshes
 """
 
 import os
@@ -67,7 +67,7 @@ def save_obj(path, verts, faces=None):
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
-        f.write("# Exported by eval.py\n")
+        f.write("# Exported by eval_v3.py\n")
         for v in verts:
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
         if faces is not None:

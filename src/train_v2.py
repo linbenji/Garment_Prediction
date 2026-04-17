@@ -42,22 +42,25 @@ from models_v2 import HybridDrapeModel, drape_loss
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#DATA_ROOT = '/workspace/batch_1500_lean'
-#RUNS_DIR  = '/workspace/runs'
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
-DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
-RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
+#DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
+#RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
+
+#DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+#RUNS_DIR   = r"/Users/Ben/Desktop/batch_1500_lean/runs"
 
 # ── Debug flag — set True to verify pipeline on small subset ──────────────────
 # Runs 2 epochs on 50 samples, no multiprocessing, easier to debug errors.
 # Set --no-debug on command line for full training.
-DEBUG = True
+DEBUG = False
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 CONFIG = {
     # Data
-    'batch_size':      2  if DEBUG else 4,
+    'batch_size':      2  if DEBUG else 8,
     'num_workers':     0  if DEBUG else 4,
     'pin_memory':      False if DEBUG else True,
     'subset_size':     50 if DEBUG else None,
