@@ -388,17 +388,18 @@ if __name__ == '__main__':
 
     # Patch HybridDrapeModel to use DummyViT so ViT_S_16 is never downloaded
     class HybridDrapeModelTest(HybridDrapeModel):
-        def __init__(self):
+        def __init__(self, gnn_layers):
             # Call nn.Module.__init__ directly to skip ViT init
             nn.Module.__init__(self)
             self.vit              = DummyViT()
             self.node_encoder     = build_mlp(NODE_IN_DIM, LATENT_DIM)
             self.edge_encoder     = build_mlp(EDGE_IN_DIM, LATENT_DIM)
-            self.processor        = nn.ModuleList([MeshBlock(LATENT_DIM) for _ in range(GNN_LAYERS)])
+            self.processor        = nn.ModuleList([MeshBlock(LATENT_DIM) for _ in range(gnn_layers)])
             self.decoder          = nn.Linear(LATENT_DIM, 3)
             self.fabric_classifier = nn.Linear(STYLE_DIM, NUM_FABRIC_FAMILIES)
 
-    model = HybridDrapeModelTest()
+    # Instantiate with the training-default of 6 layers
+    model = HybridDrapeModelTest(gnn_layers=6)
     count_parameters(model)
 
     # Build a fake batch
