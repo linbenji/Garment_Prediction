@@ -374,18 +374,24 @@ class Logger:
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
-def save_checkpoint(path, model, optimiser, scheduler, epoch, best_val_loss, config, metrics):
+def save_checkpoint(path, model, optimiser, scheduler, loss_weighter, epoch, best_val_loss, config, metrics):
     torch.save({
         'epoch': epoch, 'model_state': model.state_dict(),
         'optim_state': optimiser.state_dict(), 'sched_state': scheduler.state_dict(),
+        'loss_weighter_state': loss_weighter.state_dict(),
         'best_val_loss': best_val_loss, 'config': config, 'metrics': metrics,
     }, path)
 
-def load_checkpoint(path, model, optimiser, scheduler, device):
+def load_checkpoint(path, model, optimiser, scheduler, loss_weighter, device):
     ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt['model_state'])
     optimiser.load_state_dict(ckpt['optim_state'])
     scheduler.load_state_dict(ckpt['sched_state'])
+
+    # Load the loss weighter state if it exists (for backward compatibility)
+    if 'loss_weighter_state' in ckpt:
+        loss_weighter.load_state_dict(ckpt['loss_weighter_state'])
+
     print(f"  Resumed from epoch {ckpt['epoch']}  best_val_loss={ckpt['best_val_loss']:.6f}")
     return ckpt['epoch'], ckpt['best_val_loss']
 
@@ -486,7 +492,7 @@ def main():
     no_improve    = 0
 
     if args.resume and os.path.exists(args.resume):
-        start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimiser, scheduler, device)
+        start_epoch, best_val_loss = load_checkpoint(args.resume, model, optimiser, scheduler, loss_weighter, device)
         start_epoch += 1
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -534,14 +540,14 @@ def main():
         if improved:
             best_val_loss = val_metrics['loss']
             no_improve = 0
-            save_checkpoint(os.path.join(ckpt_dir, 'best.pt'), model, optimiser, scheduler,
+            save_checkpoint(os.path.join(ckpt_dir, 'best.pt'), model, optimiser, scheduler, loss_weighter,
                            epoch, best_val_loss, cfg, val_metrics)
         else:
             no_improve += 1
 
         if epoch % 10 == 0:
             save_checkpoint(os.path.join(ckpt_dir, f'epoch_{epoch:03d}.pt'), model, optimiser,
-                           scheduler, epoch, best_val_loss, cfg, val_metrics)
+                           scheduler, loss_weighter, epoch, best_val_loss, cfg, val_metrics)
 
         if no_improve >= cfg['early_stop_patience'] and not debug:
             print(f"\nEarly stopping — no improvement for {cfg['early_stop_patience']} epochs")
