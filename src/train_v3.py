@@ -60,14 +60,14 @@ DEBUG = False
 
 CONFIG = {
     # Data
-    'batch_size':      2  if DEBUG else 8,
+    'batch_size':      2  if DEBUG else 4,
     'num_workers':     0  if DEBUG else 4,
     'pin_memory':      False if DEBUG else True,
     'subset_size':     50 if DEBUG else None,
 
     # Training
-    'max_epochs':      2   if DEBUG else 150,
-    'early_stop_patience': 25,
+    'max_epochs':      2   if DEBUG else 100,
+    'early_stop_patience': 15,
     'grad_clip':       1.0,
 
     # Optimiser (AdamW)
@@ -75,14 +75,14 @@ CONFIG = {
     'weight_decay':    1e-4,
 
     # Scheduler (ReduceLROnPlateau)
-    'lr_patience':     8,
+    'lr_patience':     5,
     'lr_factor':       0.5,
-    'lr_min':          1e-7,
+    'lr_min':          1e-6,
 
     # Model
     'embed_dim':       128,
     'latent_dim':      128,
-    'gnn_layers':      6,
+    'gnn_layers':      8,
 
     # Logging
     'log_every':       10,

@@ -54,13 +54,13 @@ RUNS_DIR  = '/workspace/runs'
 # ── Debug flag — set True to verify pipeline on small subset ──────────────────
 # Runs 2 epochs on 50 samples, no multiprocessing, easier to debug errors.
 # Set --no-debug on command line for full training.
-DEBUG = False
+DEBUG = True
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
 CONFIG = {
     # Data
-    'batch_size':      2  if DEBUG else 8,
+    'batch_size':      2  if DEBUG else 4,
     'num_workers':     0  if DEBUG else 4,
     'pin_memory':      False if DEBUG else True,
     'subset_size':     50 if DEBUG else None,
@@ -86,7 +86,7 @@ CONFIG = {
     # Model
     'embed_dim':       128,
     'latent_dim':      128,
-    'gnn_layers':      6,
+    'gnn_layers':      8,
 
     # Logging
     'log_every':       10,

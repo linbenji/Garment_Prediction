@@ -65,14 +65,14 @@ DEBUG = False
 
 CONFIG = {
     # Data
-    'batch_size':      2  if DEBUG else 8,
+    'batch_size':      2  if DEBUG else 4,
     'num_workers':     0  if DEBUG else 4,
     'pin_memory':      False if DEBUG else True,
     'subset_size':     50 if DEBUG else None,
 
     # Training
-    'max_epochs':      2   if DEBUG else 150,
-    'early_stop_patience': 25,
+    'max_epochs':      2   if DEBUG else 100,
+    'early_stop_patience': 15,
     'grad_clip':       1.0,
 
     # Optimiser (AdamW)
@@ -80,21 +80,21 @@ CONFIG = {
     'weight_decay':    1e-4,
 
     # Scheduler (ReduceLROnPlateau)
-    'lr_patience':     8,
+    'lr_patience':     5,
     'lr_factor':       0.5,
-    'lr_min':          1e-7,
+    'lr_min':          1e-6,
 
     # Model
     'embed_dim':          128,
     'latent_dim':         128,
-    'gnn_layers':         6,
+    'gnn_layers':         8,
     # Cross-attention injection points (0-indexed layer indices)
     # None = auto: [gnn_layers//2 - 1, gnn_layers - 1] → [2, 5] for 6 layers
     # Custom examples:
     #   [2, 5]       → after layers 3 and 6 (default for 6 layers)
     #   [3, 7]       → after layers 4 and 8 (default for 8 layers)
     #   [1, 3, 5]    → three injection points across 6 layers
-    'cross_attn_layers':  None,
+    'cross_attn_layers':  [3, 7],
 
     # Logging
     'log_every':       10,
