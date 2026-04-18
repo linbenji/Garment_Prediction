@@ -3,10 +3,6 @@ train_v3.py
 
 Training loop for MasterDrapeModel (DINO + FiLM GNN)
 Supports normal consistency and bending energy losses via config flags.
-
-Usage:
-    python train_v3.py --no-debug
-    python train_v3.py --no-debug --resume runs/method2_master_v2/checkpoints/best.pt
 """
 
 import os
@@ -44,7 +40,7 @@ RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 #DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
 #RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
 
-DEBUG = True
+DEBUG = False
 
 CONFIG = {
     # Data
@@ -89,7 +85,7 @@ CONFIG = {
     # Logging
     'log_every':       10,
     'use_wandb':       True,
-    'experiment_name': 'method2_master',
+    'experiment_name': 'model_v3_master',
 }
 
 
