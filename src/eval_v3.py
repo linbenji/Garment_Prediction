@@ -1,26 +1,60 @@
 """
-eval_v3.py
+===============================================================================
+EVALUATION PIPELINE: MasterDrapeModel (v3)
+===============================================================================
 
-Evaluation script for MasterDrapeModel checkpoints.
+This script performs a rigorous, multi-faceted evaluation of the 3D garment 
+drape prediction model. It goes beyond simple average errors to measure geometric 
+precision, physical validity, silhouette accuracy, and generalization capability.
 
-Computes:
-  1. Overall MVE (mean vertex error in mm)
-  2. Per-fabric-family MVE breakdown
-  3. Per-size MVE breakdown
-  4. Generalisation condition breakdown (seen/unseen body x seen/unseen material)
-  5. Zero predictor baseline (predict zero displacement)
-  6. Mean predictor baseline (predict training mean displacement per vertex)
-  7. Saves predicted + ground truth meshes as .obj for visualisation
+Step-by-Step Execution Flow:
+-------------------------------------------------------------------------------
+1. Initialization & Loading
+   - Loads the saved checkpoint (.pt) and extracts the architecture configuration.
+   - Instantiates the MasterDrapeModel and restores its trained weights.
+   - Initializes the GarmentDataset for the requested split (usually 'test').
 
-Usage:
-    # Evaluate best checkpoint on test split
-    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt
+2. Baseline Sanity Checks (Optional but Recommended)
+   - Zero Predictor: Calculates the error if the model predicted 0 movement 
+     (garment stays in its stiff T-pose). The model MUST beat this to be useful.
+   - Mean Predictor: Calculates the "average drape" across the training set and 
+     uses it as a static prediction. The model MUST beat this to prove it has 
+     learned conditional physics (adjusting to specific images/sizes) rather 
+     than just memorizing the average shape.
 
-    # Evaluate on val split
-    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --split val
+3. The Evaluation Loop (Inference & Metric Calculation)
+   Iterates through the test dataset, performing a forward pass and computing:
+   - Point-to-Point Metrics: Mean Vertex Error (MVE) and 90th Percentile Error (P90) 
+     measure exactly how far each predicted vertex is from the ground truth.
+   - Silhouette Metrics: Chamfer Distance, Hausdorff Distance (worst-case spike), 
+     and Voxel IoU measure the overall "cloud shape" and volume accuracy, 
+     ignoring specific vertex indices.
+   - Physical Validity: Edge Strain calculates how much the fabric stretched 
+     compared to the template, ensuring it behaves like cloth, not rubber.
+   - Surface Fidelity: Normal Consistency (Cosine Similarity) measures if the 
+     wrinkles and folds are facing the correct direction.
+   - Vision Intelligence: Auxiliary Classification Accuracy checks if the DINOv2 
+     backbone correctly identified the fabric family from the 2D image.
 
-    # Evaluate and save meshes for visualisation
-    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --save-meshes
+4. Categorization & "Bucketing"
+   Instead of a single global average, the script slices the errors into domains:
+   - By Fabric Family (e.g., Denim vs. Light Knit)
+   - By Target Size (e.g., Small vs. XXL)
+   - By Generalization Condition: The most critical bucket. It isolates performance 
+     based on whether the model has seen the target body shape or fabric family 
+     during training (e.g., 'unseen_body_unseen_mat' is the ultimate stress test).
+
+5. Mesh Export (Optional)
+   - Saves a pre-defined number of predicted and ground-truth meshes (.obj) 
+     per fabric family for qualitative visual inspection in Blender/MeshLab.
+
+6. Aggregation & Statistical Output
+   - Threshold Success Rates: Converts continuous distances into a binary "Accuracy %" 
+     (e.g., What percentage of test samples achieved < 5mm error?).
+   - Generalization Gap: Calculates the ratio of error on unseen data vs. seen data.
+   - Saves a cumulative accuracy plot (.png), a threshold table (.csv), and a 
+     comprehensive metrics summary (.json) to the results directory.
+===============================================================================
 """
 
 import os
@@ -29,11 +63,14 @@ import json
 import argparse
 import numpy as np
 import torch
+import torch.nn.functional as F
 from collections import defaultdict
 from torch_geometric.loader import DataLoader
+from scipy.spatial import KDTree
+import matplotlib.pyplot as plt
+import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 from dataloader_v2 import GarmentDataset
 from models_v3 import MasterDrapeModel
 
@@ -56,8 +93,17 @@ FAMILY_GROUP = {
 
 FABRIC_FAMILY_IDX = {f: i for i, f in enumerate(FABRIC_FAMILIES)}
 
+# Define what constitutes Great, Good, and Acceptable for each metric
+THRESHOLDS = {
+    'mve':       {'great': 5.0,  'good': 10.0, 'acceptable': 20.0},  # mm
+    'chamfer':   {'great': 5.0,  'good': 10.0, 'acceptable': 20.0},  # mm
+    'hausdorff': {'great': 20.0, 'good': 50.0, 'acceptable': 80.0},  # mm
+    'strain':    {'great': 0.05, 'good': 0.10, 'acceptable': 0.20},  # 5%, 10%, 20%
+    'iou':       {'great': 0.90, 'good': 0.80, 'acceptable': 0.70},  # Volume overlap
+    'normals':   {'great': 0.95, 'good': 0.90, 'acceptable': 0.80},  # Cosine similarity
+}
 
-# ── OBJ writer ────────────────────────────────────────────────────────────────
+# ── Mesh & Geometry Helpers ───────────────────────────────────────────────────
 
 def save_obj(path, verts, faces=None):
     """
@@ -74,25 +120,49 @@ def save_obj(path, verts, faces=None):
             for face in faces:
                 f.write(f"f {face[0]+1} {face[1]+1} {face[2]+1}\n")
 
-
-# ── Metric helpers ────────────────────────────────────────────────────────────
-
-def vertex_errors(pred_delta, target_delta):
+def compute_chamfer_hausdorff(pred, gt):
     """
-    Per-vertex Euclidean error in mm.
-    Returns (N,) tensor.
+    - Computes the maximum distance from any point in the prediction to the nearest point in the ground truth
+        - Identifies the "worst-case" failure
+    - O(N log N) distance calculation using KD-Trees
     """
-    return (pred_delta - target_delta).norm(dim=1)
+    tree_gt = KDTree(gt)
+    dist_p_to_g, _ = tree_gt.query(pred)
+    
+    tree_pred = KDTree(pred)
+    dist_g_to_p, _ = tree_pred.query(gt)
+    
+    chamfer = (np.mean(dist_p_to_g) + np.mean(dist_g_to_p)) / 2
+    hausdorff = max(np.max(dist_p_to_g), np.max(dist_g_to_p))
+    return chamfer, hausdorff
 
+def compute_iou(pred, gt, grid_res=32):
+    """
+    Voxel-based Intersection over Union for silhouette accuracy
+    - It tells you if the model correctly captured the "envelope" of the garment around the body
+    """
+    all_pts = np.concatenate([pred, gt], axis=0)
+    mins, maxs = all_pts.min(axis=0), all_pts.max(axis=0)
+    
+    def get_voxels(pts):
+        voxels = ((pts - mins) / (maxs - mins + 1e-9) * (grid_res - 1)).astype(int)
+        return set(map(tuple, np.unique(voxels, axis=0)))
 
-def mve(pred_delta, target_delta):
-    """Mean vertex error in mm — scalar."""
-    return vertex_errors(pred_delta, target_delta).mean().item()
+    v_pred, v_gt = get_voxels(pred), get_voxels(gt)
+    union = len(v_pred.union(v_gt))
+    return len(v_pred.intersection(v_gt)) / union if union > 0 else 0
 
-
-def p90_ve(pred_delta, target_delta):
-    """90th percentile vertex error in mm."""
-    return vertex_errors(pred_delta, target_delta).quantile(0.90).item()
+def compute_normals_sim(pred, gt, faces):
+    """
+    Cosine similarity of face normals
+    - High MVE with low Normal Consistency means the shirt is in the right place,
+            but the wrinkles and folds are missing or facing the wrong way
+    """
+    def get_normals(verts):
+        v0, v1, v2 = verts[faces[:, 0]], verts[faces[:, 1]], verts[faces[:, 2]]
+        n = np.cross(v1 - v0, v2 - v0)
+        return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-9)
+    return np.mean(np.sum(get_normals(pred) * get_normals(gt), axis=1))
 
 
 # ── Baselines ─────────────────────────────────────────────────────────────────
@@ -108,7 +178,7 @@ def compute_zero_baseline(loader, device):
         pred  = torch.zeros_like(batch.y)
         for i in range(batch.num_graphs):
             mask = (batch.batch == i)
-            errors.append(mve(pred[mask], batch.y[mask]))
+            errors.append((pred[mask] - batch.y[mask]).norm(dim=1).mean().item())
     return float(np.mean(errors))
 
 
@@ -140,315 +210,247 @@ def compute_mean_baseline(train_loader, eval_loader, device):
         batch = batch.to(device)
         for i in range(batch.num_graphs):
             mask = (batch.batch == i)
-            errors.append(mve(mean_disp, batch.y[mask]))
-
+            errors.append((mean_disp - batch.y[mask]).norm(dim=1).mean().item())
     return float(np.mean(errors))
 
 
-# ── Main evaluation ───────────────────────────────────────────────────────────
+# ── Main Evaluation ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, device, save_meshes=False, mesh_dir=None,
-             faces=None, template_verts=None, n_save=3):
-    """
-    Run evaluation on a DataLoader.
-
-    Returns dict of metrics and optionally saves predicted meshes.
-    """
+def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, template_verts=None, n_save=3):
     model.eval()
+    os.makedirs(results_dir, exist_ok=True)
+    mesh_dir = os.path.join(results_dir, 'meshes') if save_meshes else None
 
-    # Accumulators
-    all_mve          = []
-    all_p90          = []
-    by_family        = defaultdict(list)
-    by_size          = defaultdict(list)
+    # Core Metrics Tracker
+    metrics = defaultdict(list)
+    
+    # Categorization Trackers
+    by_family = defaultdict(list)
+    by_size = defaultdict(list)
     by_gen_condition = defaultdict(list)
+    saved_per_family = defaultdict(int)
+    
+    cls_correct = 0
+    total_samples = 0
 
-    # For mesh saving — pick n_save samples per fabric family
-    saved_per_family  = defaultdict(int)
-    meshes_to_save    = []
-
-    sample_idx = 0
+    print(f"  Evaluating {len(loader.dataset)} samples...")
 
     for batch in loader:
         batch = batch.to(device)
+        pred_delta, fabric_logits = model(batch)
+        
+        # Classification Accuracy
+        preds_cls = fabric_logits.argmax(dim=1)
+        cls_correct += (preds_cls == batch.fabric_family_label).sum().item()
 
-        predicted_delta, _ = model(batch)
+        # Pre-calculate Strain on the GPU (much faster)
+        src, dst = batch.edge_index
+        pred_len = torch.norm((batch.pos[src] + pred_delta[src]) - (batch.pos[dst] + pred_delta[dst]), dim=1)
+        gt_len = torch.norm((batch.pos[src] + batch.y[src]) - (batch.pos[dst] + batch.y[dst]), dim=1)
+        batch_strain = torch.abs(pred_len - gt_len) / (gt_len + 1e-9)
 
         for i in range(batch.num_graphs):
-            mask       = (batch.batch == i)
-            pred_d     = predicted_delta[mask]   # (14117, 3)
-            gt_d       = batch.y[mask]           # (14117, 3)
+            # 1. Isolate the specific graph
+            mask = (batch.batch == i)
+            edge_mask = (batch.batch[batch.edge_index[0]] == i)
+            
+            p_verts = (batch.pos[mask] + pred_delta[mask]).cpu().numpy()
+            g_verts = (batch.pos[mask] + batch.y[mask]).cpu().numpy()
+            
+            # 2. Calculate Core Metrics
+            mve = np.linalg.norm(p_verts - g_verts, axis=1).mean()
+            p90 = np.quantile(np.linalg.norm(p_verts - g_verts, axis=1), 0.90)
+            chamfer, hausdorff = compute_chamfer_hausdorff(p_verts, g_verts)
+            iou = compute_iou(p_verts, g_verts)
+            max_strain = batch_strain[edge_mask].max().item()
 
-            err        = mve(pred_d, gt_d)
-            p90_err    = p90_ve(pred_d, gt_d)
+            metrics['mve'].append(mve)
+            metrics['p90'].append(p90)
+            metrics['chamfer'].append(chamfer)
+            metrics['hausdorff'].append(hausdorff)
+            metrics['iou'].append(iou)
+            metrics['strain'].append(max_strain)
+            
+            if faces is not None:
+                metrics['normals'].append(compute_normals_sim(p_verts, g_verts, faces))
 
-            all_mve.append(err)
-            all_p90.append(p90_err)
-
-            # Metadata from batch
-            body_id   = batch.body_id[i].item()
+            # 3. Categorization & Metadata
+            body_id = batch.body_id[i].item()
             fab_label = batch.fabric_family_label[i].item()
-            fab_name  = FABRIC_FAMILIES[fab_label] if fab_label < len(FABRIC_FAMILIES) else 'unknown'
+            fab_name = FABRIC_FAMILIES[fab_label] if fab_label < len(FABRIC_FAMILIES) else 'unknown'
             fab_group = FAMILY_GROUP.get(fab_name, 0)
-
-            # Size — decode from tgt_size tensor
-            # tgt_size is [width_pct, height_pct] — use it to infer size name
-            size_enc  = batch.tgt_size.view(-1, 2)[i]
+            
+            size_enc = batch.tgt_size.view(-1, 2)[i]
             width_pct = round(size_enc[0].item(), 2)
-            SIZE_FROM_WIDTH = {0.92: 'small', 1.0: 'medium', 1.08: 'large',
-                               1.17: 'xl', 1.28: 'xxl'}
-            size_name = SIZE_FROM_WIDTH.get(width_pct, f'w={width_pct}')
+            size_name = {0.92: 'small', 1.0: 'medium', 1.08: 'large', 1.17: 'xl', 1.28: 'xxl'}.get(width_pct, f'w={width_pct}')
 
-            by_family[fab_name].append(err)
-            by_size[size_name].append(err)
+            by_family[fab_name].append(mve)
+            by_size[size_name].append(mve)
 
-            # Generalisation condition
-            if body_id <= 22 and fab_group <= 5:
-                gen_cond = 'seen_body_seen_mat'
-            elif body_id <= 12 and fab_group == 6:
-                gen_cond = 'seen_body_unseen_mat_val'
-            elif body_id <= 22 and fab_group == 6:
-                gen_cond = 'seen_body_unseen_mat_test'
-            elif body_id >= 23 and fab_group <= 2:
-                gen_cond = 'unseen_body_seen_mat_val'
-            elif body_id >= 23 and fab_group <= 5:
-                gen_cond = 'unseen_body_seen_mat_test'
-            else:
-                gen_cond = 'unseen_body_unseen_mat'
-            by_gen_condition[gen_cond].append(err)
+            # Generalization Buckets
+            if body_id <= 22 and fab_group <= 5:     gen_cond = 'seen_body_seen_mat'
+            elif body_id <= 12 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_val'
+            elif body_id <= 22 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_test'
+            elif body_id >= 23 and fab_group <= 2:   gen_cond = 'unseen_body_seen_mat_val'
+            elif body_id >= 23 and fab_group <= 5:   gen_cond = 'unseen_body_seen_mat_test'
+            else:                                    gen_cond = 'unseen_body_unseen_mat'
+            by_gen_condition[gen_cond].append(mve)
 
-            # Collect meshes for saving
+            metrics['body_id'].append(body_id)
+            metrics['fab_label'].append(fab_label)
+
+            # 4. Save Meshes
             if save_meshes and saved_per_family[fab_name] < n_save:
-                pos = batch.pos[mask].cpu().numpy()   # template positions
-                pred_mesh = pos + pred_d.cpu().numpy()
-                gt_mesh   = pos + gt_d.cpu().numpy()
-                meshes_to_save.append({
-                    'idx':       sample_idx,
-                    'fabric':    fab_name,
-                    'size':      size_name,
-                    'body_id':   body_id,
-                    'err_mm':    err,
-                    'pred_verts': pred_mesh,
-                    'gt_verts':   gt_mesh,
-                    'template_verts': pos,
-                })
+                prefix = f"body{body_id:03d}_{fab_name}_{size_name}_mve{mve:.1f}mm"
+                save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"), p_verts, faces)
+                save_obj(os.path.join(mesh_dir, f"{prefix}_gt.obj"), g_verts, faces)
                 saved_per_family[fab_name] += 1
 
-            sample_idx += 1
+            total_samples += 1
 
-    # ── Save meshes ───────────────────────────────────────────────────────────
-    if save_meshes and mesh_dir and meshes_to_save:
-        print(f"\n  Saving {len(meshes_to_save)} meshes to {mesh_dir}")
-        for m in meshes_to_save:
-            prefix = (f"body{m['body_id']:03d}_{m['fabric']}_"
-                      f"{m['size']}_mve{m['err_mm']:.1f}mm")
-            save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"),
-                     m['pred_verts'], faces)
-            save_obj(os.path.join(mesh_dir, f"{prefix}_gt.obj"),
-                     m['gt_verts'], faces)
-            save_obj(os.path.join(mesh_dir, f"{prefix}_template.obj"),
-                     m['template_verts'], faces)
+    # ── Post-Processing & Tables ──────────────────────────────────────────────
+    
+    # 1. Means
+    final_stats = {k: np.mean(v) for k, v in metrics.items() if k not in ['body_id', 'fab_label']}
+    final_stats['cls_acc'] = cls_correct / total_samples
 
-    return {
-        'mve':            float(np.mean(all_mve)),
-        'p90_ve':         float(np.mean(all_p90)),
-        'mve_std':        float(np.std(all_mve)),
-        'n_samples':      len(all_mve),
-        'by_family':      {k: float(np.mean(v)) for k, v in by_family.items()},
-        'by_size':        {k: float(np.mean(v)) for k, v in by_size.items()},
-        'by_gen':         {k: float(np.mean(v)) for k, v in by_gen_condition.items()},
-    }
+    # 2. Generalization Gaps
+    mve_arr = np.array(metrics['mve'])
+    b_ids, f_lbls = np.array(metrics['body_id']), np.array(metrics['fab_label'])
+    
+    final_stats['body_gen_ratio'] = mve_arr[b_ids >= 23].mean() / (mve_arr[b_ids < 23].mean() + 1e-9)
+    final_stats['fabric_gen_ratio'] = mve_arr[f_lbls == 5].mean() / (mve_arr[f_lbls != 5].mean() + 1e-9)
 
+    # 3. Threshold Table CSV
+    table_data = []
+    for m_name, thresh_dict in THRESHOLDS.items():
+        if m_name not in metrics: continue
+        row = {'Metric': m_name.upper()}
+        vals = np.array(metrics[m_name])
+        for label, t_val in thresh_dict.items():
+            acc = (vals >= t_val).mean() * 100 if m_name in ['normals', 'iou'] else (vals <= t_val).mean() * 100
+            row[f"{label.capitalize()} (%)"] = f"{acc:.1f}%"
+        table_data.append(row)
+    
+    df = pd.DataFrame(table_data)
+    df.to_csv(os.path.join(results_dir, 'threshold_performance.csv'), index=False)
 
-# ── Pretty printing ───────────────────────────────────────────────────────────
+    # 4. Cumulative Accuracy Plot
+    plt.figure(figsize=(10, 6))
+    for m_name in ['mve', 'chamfer', 'hausdorff']:
+        sorted_data = np.sort(metrics[m_name])
+        y = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
+        plt.plot(sorted_data, y, label=f'{m_name.upper()}')
+    
+    plt.axvline(x=10, color='r', linestyle='--', alpha=0.5, label='10mm Threshold')
+    plt.xlabel('Error Distance (mm)')
+    plt.ylabel('Fraction of Test Set (Accuracy)')
+    plt.title('Cumulative Accuracy (Distance Metrics)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(results_dir, 'cumulative_accuracy.png'), dpi=300)
+    plt.close()
 
-def print_results(results, split, baselines=None):
-    print(f"\n{'='*65}")
-    print(f"EVALUATION RESULTS — {split.upper()}")
-    print(f"{'='*65}")
-    print(f"  Samples evaluated: {results['n_samples']}")
-    print(f"  Overall MVE:       {results['mve']:.2f} mm")
-    print(f"  P90 vertex error:  {results['p90_ve']:.2f} mm")
-    print(f"  MVE std:           {results['mve_std']:.2f} mm")
+    return final_stats, df, by_family, by_size, by_gen_condition
+
+# ── Output Formatting ─────────────────────────────────────────────────────────
+
+def print_results(stats, df, by_family, by_size, by_gen, baselines):
+    print(f"\n{'='*70}")
+    print(f"EVALUATION RESULTS")
+    print(f"{'='*70}")
+    print(f"  Classification Accuracy: {stats['cls_acc']:.1%}")
+    print(f"  Overall MVE:             {stats['mve']:.2f} mm")
+    print(f"  P90 Vertex Error:        {stats['p90']:.2f} mm")
+    print(f"  Chamfer Distance:        {stats['chamfer']:.2f} mm")
+    print(f"  Hausdorff Distance:      {stats['hausdorff']:.2f} mm")
+    print(f"  Mesh Silhouette IoU:     {stats['iou']:.1%}")
+    if 'normals' in stats:
+        print(f"  Normal Consistency:      {stats['normals']:.3f} (cosine sim)")
+    print(f"  Max Edge Strain:         {stats['strain']:.1%}")
 
     if baselines:
         print(f"\n── Baselines ──")
-        print(f"  Zero predictor:   {baselines['zero']:.2f} mm  "
-              f"({'↑' if results['mve'] < baselines['zero'] else '↓'} model "
-              f"{'beats' if results['mve'] < baselines['zero'] else 'worse than'} baseline)")
+        print(f"  Zero Predictor MVE:      {baselines['zero']:.2f} mm")
         if 'mean' in baselines:
-            print(f"  Mean predictor:   {baselines['mean']:.2f} mm  "
-                  f"({'↑' if results['mve'] < baselines['mean'] else '↓'} model "
-                  f"{'beats' if results['mve'] < baselines['mean'] else 'worse than'} baseline)")
+            print(f"  Mean Predictor MVE:      {baselines['mean']:.2f} mm")
 
-    print(f"\n── By fabric family ──")
-    print(f"  {'Family':<20} {'MVE (mm)':>10}  {'vs overall':>12}")
-    print(f"  {'-'*20} {'-'*10}  {'-'*12}")
-    for fam in FABRIC_FAMILIES:
-        if fam in results['by_family']:
-            val  = results['by_family'][fam]
-            diff = val - results['mve']
-            tag  = f"+{diff:.2f}" if diff > 0 else f"{diff:.2f}"
-            unseen = " ← UNSEEN" if fam == 'heavy_woven' else ""
-            print(f"  {fam:<20} {val:>10.2f}  {tag:>12}{unseen}")
+    print(f"\n── Threshold Success Rates ──")
+    print(df.to_string(index=False))
 
-    print(f"\n── By size ──")
-    print(f"  {'Size':<10} {'MVE (mm)':>10}  {'vs overall':>12}")
-    print(f"  {'-'*10} {'-'*10}  {'-'*12}")
-    for size in SIZES:
-        if size in results['by_size']:
-            val  = results['by_size'][size]
-            diff = val - results['mve']
-            tag  = f"+{diff:.2f}" if diff > 0 else f"{diff:.2f}"
-            print(f"  {size:<10} {val:>10.2f}  {tag:>12}")
+    print(f"\n── Generalization Gaps ──")
+    print(f"  Body Gen Ratio (Unseen/Seen):   {stats['body_gen_ratio']:.2f}x")
+    print(f"  Fabric Gen Ratio (Unseen/Seen): {stats['fabric_gen_ratio']:.2f}x")
+    
+    print(f"\n── Specific Generalization Conditions (MVE) ──")
+    for key, val in by_gen.items():
+        print(f"  {val:>7.2f} mm | {key}")
 
-    print(f"\n── Generalisation conditions ──")
-    GEN_LABELS = {
-        'seen_body_seen_mat':         'Seen body   / Seen material   (train dist)',
-        'seen_body_unseen_mat_val':   'Seen body   / Unseen material (val)',
-        'seen_body_unseen_mat_test':  'Seen body   / Unseen material (test)',
-        'unseen_body_seen_mat_val':   'Unseen body / Seen material   (val)',
-        'unseen_body_seen_mat_test':  'Unseen body / Seen material   (test)',
-        'unseen_body_unseen_mat':     'Unseen body / Unseen material (hardest)',
-    }
-    for key, label in GEN_LABELS.items():
-        if key in results['by_gen']:
-            val = results['by_gen'][key]
-            print(f"  {val:>7.2f} mm  {label}")
-
-    # Generalisation gap — key research metric
-    seen  = results['by_gen'].get('seen_body_seen_mat', None)
-    hard  = results['by_gen'].get('unseen_body_unseen_mat', None)
-    if seen and hard:
-        gap = hard - seen
-        print(f"\n  Generalisation gap (hardest - seen): {gap:+.2f} mm")
-        print(f"  {'Good generalisation' if gap < 5 else 'Moderate generalisation' if gap < 15 else 'Poor generalisation'} "
-              f"(gap < 5mm = good, < 15mm = moderate, > 15mm = poor)")
-
-    print(f"{'='*65}")
-
+    print(f"{'='*70}")
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', type=str, required=True,
-                        help='Path to checkpoint .pt file')
-    parser.add_argument('--split',      type=str, default='test',
-                        choices=['train', 'val', 'test'],
-                        help='Dataset split to evaluate on (default: test)')
-    parser.add_argument('--data-root',  type=str, default=DATA_ROOT)
+    parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint .pt file')
+    parser.add_argument('--split', type=str, default='test', choices=['train', 'val', 'test'])
     parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--save-meshes', action='store_true',
-                        help='Save predicted + GT meshes as .obj files')
-    parser.add_argument('--baselines',  action='store_true',
-                        help='Compute zero and mean predictor baselines '
-                             '(requires loading train set, slower)')
+    parser.add_argument('--save-meshes', action='store_true', help='Export .obj files')
+    parser.add_argument('--baselines', action='store_true', help='Compute zero/mean baselines (slower)')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    print(f"Checkpoint: {args.checkpoint}")
-    print(f"Split: {args.split}")
+    print(f"Device: {device} | Checkpoint: {args.checkpoint}")
 
-    # ── Load checkpoint ───────────────────────────────────────────────────────
     if not os.path.exists(args.checkpoint):
-        print(f"ERROR: checkpoint not found: {args.checkpoint}")
+        print(f"ERROR: Checkpoint missing.")
         return
 
+    # Load Model
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    cfg  = ckpt.get('config', {})
-    print(f"Checkpoint epoch: {ckpt.get('epoch', '?')}")
-    print(f"Best val loss:    {ckpt.get('best_val_loss', '?'):.4f}")
-
-    # ── Build model and load weights ──────────────────────────────────────────
+    cfg = ckpt.get('config', {})
     model = MasterDrapeModel(
-        embed_dim  = cfg.get('embed_dim',  128),
-        latent_dim = cfg.get('latent_dim', 128),
-        gnn_layers = cfg.get('gnn_layers', 10),
+        embed_dim=cfg.get('embed_dim', 128),
+        latent_dim=cfg.get('latent_dim', 128),
+        gnn_layers=cfg.get('gnn_layers', 6),
     ).to(device)
     model.load_state_dict(ckpt['model_state'])
-    model.eval()
-    print(f"Model loaded successfully")
+    
+    # Load Data
+    eval_ds = GarmentDataset(DATA_ROOT, split=args.split, augment=False)
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False)
 
-    # ── Load dataset ──────────────────────────────────────────────────────────
-    print(f"\nLoading {args.split} dataset...")
-    eval_ds = GarmentDataset(args.data_root, split=args.split, augment=False)
-    eval_loader = DataLoader(
-        eval_ds,
-        batch_size  = args.batch_size,
-        shuffle     = False,
-        num_workers = 0,
-        pin_memory  = False,
-    )
-    print(f"  {len(eval_ds)} samples  ({len(eval_loader)} batches)")
+    # Load Faces
+    faces_path = os.path.join(DATA_ROOT, 'template', 'faces.npy')
+    faces = np.load(faces_path).astype(np.int32) if os.path.exists(faces_path) else None
+    if faces is None: print("Warning: faces.npy not found. Normal Consistency skipped.")
 
-    # ── Load template faces for mesh saving ───────────────────────────────────
-    faces = None
-    template_verts = None
-    if args.save_meshes:
-        faces_path = os.path.join(args.data_root, 'template', 'faces.npy')
-        tverts_path = os.path.join(args.data_root, 'template', 'template_verts.npy')
-        if os.path.exists(faces_path):
-            import numpy as np
-            faces = np.load(faces_path).astype(np.int32)
-            print(f"  Faces loaded for mesh export: {faces.shape}")
-        if os.path.exists(tverts_path):
-            template_verts = np.load(tverts_path).astype(np.float32)
+    # Results Directory Setup
+    run_dir = os.path.dirname(os.path.dirname(args.checkpoint))
+    results_dir = os.path.join(run_dir, f'eval_results_{args.split}')
 
-    # ── Mesh output directory ─────────────────────────────────────────────────
-    ckpt_dir  = os.path.dirname(args.checkpoint)
-    run_dir   = os.path.dirname(ckpt_dir)
-    mesh_dir  = os.path.join(run_dir, 'meshes', args.split) \
-                if args.save_meshes else None
-
-    # ── Run evaluation ────────────────────────────────────────────────────────
-    print(f"\nRunning evaluation...")
-    results = evaluate(
-        model, eval_loader, device,
-        save_meshes     = args.save_meshes,
-        mesh_dir        = mesh_dir,
-        faces           = faces,
-        template_verts  = template_verts,
-        n_save          = 3,   # save 3 samples per fabric family
-    )
-
-    # ── Compute baselines ─────────────────────────────────────────────────────
-    baselines = None
+    # Baselines
+    baselines = {}
     if args.baselines:
-        print(f"\nComputing baselines...")
-        baselines = {}
-
-        # Zero baseline — predict zero displacement
-        print("  Zero predictor...")
+        print("\nComputing baselines...")
         baselines['zero'] = compute_zero_baseline(eval_loader, device)
-        print(f"    Zero predictor MVE: {baselines['zero']:.2f} mm")
-
-        # Mean baseline — needs training set
-        print("  Mean predictor (loading train set)...")
-        train_ds     = GarmentDataset(args.data_root, split='train', augment=False)
-        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                  shuffle=False, num_workers=0, pin_memory=False)
+        train_loader = DataLoader(GarmentDataset(DATA_ROOT, split='train', augment=False), batch_size=args.batch_size)
         baselines['mean'] = compute_mean_baseline(train_loader, eval_loader, device)
-        print(f"    Mean predictor MVE: {baselines['mean']:.2f} mm")
 
-    # ── Print results ─────────────────────────────────────────────────────────
-    print_results(results, args.split, baselines)
+    # Evaluate
+    print("\nStarting comprehensive evaluation...")
+    stats, df, by_family, by_size, by_gen = evaluate(
+        model, eval_loader, device, results_dir, 
+        save_meshes=args.save_meshes, faces=faces
+    )
 
-    # ── Save results JSON ─────────────────────────────────────────────────────
-    results_path = os.path.join(run_dir, f'eval_{args.split}.json')
-    output = {
-        'checkpoint':  args.checkpoint,
-        'split':       args.split,
-        'epoch':       ckpt.get('epoch'),
-        'results':     results,
-        'baselines':   baselines,
-    }
-    with open(results_path, 'w') as f:
-        json.dump(output, f, indent=2)
-    print(f"\nResults saved: {results_path}")
+    # Save and Print
+    with open(os.path.join(results_dir, 'summary_stats.json'), 'w') as f:
+        json.dump({**stats, 'baselines': baselines}, f, indent=2)
 
+    print_results(stats, df, by_family, by_size, by_gen, baselines)
+    print(f"\nAll plots and tables saved to: {results_dir}")
 
 if __name__ == '__main__':
     main()
