@@ -91,8 +91,11 @@ from models_v3 import MasterDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_ROOT = '/workspace/batch_1500_lean'
-RUNS_DIR  = '/workspace/runs'
+#DATA_ROOT = '/workspace/batch_1500_lean'
+#RUNS_DIR  = '/workspace/runs'
+
+DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
 FABRIC_FAMILIES = [
     'light_knit', 'medium_knit', 'heavy_knit',
@@ -117,6 +120,12 @@ THRESHOLDS = {
     'iou':       {'great': 0.90, 'good': 0.80, 'acceptable': 0.70},  # Volume overlap
     'normals':   {'great': 0.95, 'good': 0.90, 'acceptable': 0.80},  # Cosine similarity
 }
+
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if hasattr(obj, 'item'):
+            return obj.item()
+        return super().default(obj)
 
 # ── Mesh & Geometry Helpers ───────────────────────────────────────────────────
 
@@ -400,7 +409,7 @@ def print_results(stats, df, by_family, by_size, by_gen, baselines):
     
     print(f"\n── Specific Generalization Conditions (MVE) ──")
     for key, val in by_gen.items():
-        print(f"  {val:>7.2f} mm | {key}")
+        print(f"  {np.mean(val):>7.2f} mm | {key}")
 
     print(f"{'='*70}")
 
@@ -428,7 +437,7 @@ def main():
     model = MasterDrapeModel(
         embed_dim=cfg.get('embed_dim', 128),
         latent_dim=cfg.get('latent_dim', 128),
-        gnn_layers=cfg.get('gnn_layers', 6),
+        gnn_layers=cfg.get('gnn_layers', 8),
     ).to(device)
     model.load_state_dict(ckpt['model_state'])
     
@@ -462,7 +471,7 @@ def main():
 
     # Save and Print
     with open(os.path.join(results_dir, 'summary_stats.json'), 'w') as f:
-        json.dump({**stats, 'baselines': baselines}, f, indent=2)
+        json.dump({**stats, 'baselines': baselines}, f, indent=2, cls=NumpyEncoder)
 
     print_results(stats, df, by_family, by_size, by_gen, baselines)
     print(f"\nAll plots and tables saved to: {results_dir}")
