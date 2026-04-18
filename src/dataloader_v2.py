@@ -331,8 +331,8 @@ if __name__ == '__main__':
     sample = datasets['train'][0]
     EXPECTED_SHAPES = {
         'pos':         (14117, 3),
-        'edge_index':  (2, 82988),
-        'edge_attr':   (82988, 4),
+        'edge_index':  (2, 83024),
+        'edge_attr':   (83024, 4),
         'uvs':         (14117, 2),
         'normals':     (14117, 3),
         'y':           (14117, 3),
