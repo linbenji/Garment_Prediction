@@ -44,7 +44,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v4_2 import UnfrozenCLSDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
+from models_v4 import UnfrozenCLSDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
