@@ -1,7 +1,7 @@
 """
 models_v4_2.py
 
-MasterDrapeModel: DINOv2 (LoRA) + FiLM-Modulated MeshGraphNet + CLS Cross-Attention
+UnfrozenCLSDrapeModel: DINOv2 (LoRA) + FiLM-Modulated MeshGraphNet + CLS Cross-Attention
 
 CHANGE FROM models_v4.py: One thing only — the vision backbone.
     models_v4.py   : StyleViT_DINO      — fully frozen, torch.no_grad(), 0 trainable ViT params
@@ -13,7 +13,7 @@ Everything else is identical to models_v4.py:
     - Same AutomaticLossWeighter (variadic *losses interface)
     - Same drape_loss (normal consistency + bending energy + all physics losses)
     - Same build_face_adjacency, compute_face_normals, all helpers
-    - Same MasterDrapeModel forward() logic
+    - Same UnfrozenCLSDrapeModel forward() logic
 
 Why LoRA on the backbone:
     Frozen DINOv2 produces a generic CLS embedding. LoRA fine-tunes only the
@@ -235,11 +235,11 @@ class AutomaticLossWeighter(nn.Module):
 
 # ── Master Model ──────────────────────────────────────────────────────────────
 
-class MasterDrapeModel(nn.Module):
+class UnfrozenCLSDrapeModel(nn.Module):
     """
     v4.2 — LoRA DINOv2 + FiLM + CLS CrossAttention
 
-    Identical to models_v4.py MasterDrapeModel except:
+    Identical to models_v4.py UnfrozenCLSDrapeModel except:
         self.vit = StyleViT_DINO_LoRA(...)  instead of StyleViT_DINO(...)
 
     Adds lora_rank, lora_alpha, lora_blocks to __init__.

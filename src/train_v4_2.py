@@ -1,7 +1,9 @@
 """
 train_v4_2.py
 
-Training loop for MasterDrapeModel v4.2 (LoRA DINOv2 + FiLM + CLS Cross-Attention)
+This will have a new name v4 but originally it was v4.2 just so you know 
+
+Training loop for UnfrozenCLSDrapeModel v4.2 (LoRA DINOv2 + FiLM + CLS Cross-Attention)
 
 CHANGES FROM train_v4.py — exactly three things:
     1. from models_v4_2 import ...        (was models_v4)
@@ -10,7 +12,7 @@ CHANGES FROM train_v4.py — exactly three things:
            'lora_rank':   4
            'lora_alpha':  8
            'lora_blocks': 4
-       ...and MasterDrapeModel instantiation passes these through.
+       ...and UnfrozenCLSDrapeModel instantiation passes these through.
 
 Everything else — train loop, val loop, logger, checkpointing, face adjacency
 precomputation, loss weighter builder — is identical to train_v4.py.
@@ -42,7 +44,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v4_2 import MasterDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
+from models_v4_2 import UnfrozenCLSDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -458,7 +460,7 @@ def main():
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nBuilding model...")
-    model = MasterDrapeModel(
+    model = UnfrozenCLSDrapeModel(
         gnn_layers        = cfg['gnn_layers'],
         embed_dim         = cfg['embed_dim'],
         latent_dim        = cfg['latent_dim'],
