@@ -5,16 +5,9 @@ MasterDrapeModel: DINOv2 (Frozen) + FiLM-Modulated MeshGraphNet + CLS Cross-Atte
 Architecture:
   StyleViT_DINO      : DINOv2-Small (frozen) -> projection head -> 128-dim style
   Context Inject     : MLP -> FiLM (Feature-wise Linear Modulation) [Scale & Shift]
-  CrossAttentionLayer: Per-vertex style gating at GNN layers 3 and 6
+  CrossAttentionLayer: Per-vertex style gating at configurable GNN layers
   MeshGraphNet       : encode-process-decode with FiLM residuals + cross-attention injection
-  Losses             : Position MSE + Edge Strain + SMPL Collision Penalty (disabled) + Aux Cls
-
-Changes from v3:
-  - Added CrossAttentionLayer class (per-vertex gated attention over CLS style embedding)
-  - Injected at GNN layers 3 and 6 (after FiLM modulation, additive residual)
-  - FiLM conditioning unchanged — cross-attention is additive on top, not replacing it
-  - All loss functions, constants, and other classes unchanged from teammate's v3
-  - MasterDrapeModel.__init__ signature matches teammate's v3: gnn_layers is first positional arg
+  Losses             : Position MSE + Edge Strain + Normal Consistency + Bending Energy + Collision + Aux Cls
 """
 
 import torch
@@ -38,8 +31,6 @@ LATENT_DIM   = 128
 
 NUM_FABRIC_FAMILIES = 6
 
-# [MASSIVE UPGRADE FROM V2]: Node input shrinks from 158 to 8
-# Context (150-dim) now bypasses the graph and goes directly to the FiLM Controller.
 NODE_IN_DIM     = NODE_POS_DIM + NODE_UV_DIM + NODE_NORMAL_DIM
 GLOBAL_COND_DIM = STYLE_DIM + SMPL_DIM + PHYSICS_DIM + SIZE_DIM
 
@@ -61,17 +52,11 @@ def build_mlp(in_dim, out_dim, hidden_dim=256):
 # ── Vision Backbone: Frozen DINOv2 ───────────────────────────────────────────
 
 class StyleViT_DINO(nn.Module):
-    """
-    Frozen Meta DINOv2-Small + Trainable Projection Head
-    Solves the Sim-to-Real gap by leveraging pre-trained depth/geometry logic
-    """
     def __init__(self, embed_dim=STYLE_DIM):
         super().__init__()
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
-
         for param in self.backbone.parameters():
             param.requires_grad = False
-
         self.projection_head = nn.Sequential(
             nn.Linear(384, 256),
             nn.GELU(),
@@ -81,44 +66,27 @@ class StyleViT_DINO(nn.Module):
 
     def forward(self, images):
         with torch.no_grad():
-            features = self.backbone(images)   # (B, 384) CLS token
-        return self.projection_head(features)  # (B, 128)
+            features = self.backbone(images)
+        return self.projection_head(features)
 
 
 # ── FiLM Modulated Message Passing Block ─────────────────────────────────────
 
 class FiLMMeshBlock(MessagePassing):
-    """
-    MeshGraphNet layer modulated by global context (Body Size, Fabric, Style)
-    """
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__(aggr='sum')
-
         self.edge_mlp = build_mlp(latent_dim * 3, latent_dim)
         self.node_mlp = build_mlp(latent_dim * 2, latent_dim)
-
-        # FiLM specific normalization to zero-center features before modulation
         self.norm = nn.LayerNorm(latent_dim)
 
     def forward(self, x, edge_index, edge_attr, gamma, beta):
-        """
-        gamma, beta: (Total_Nodes, latent_dim) - The broadcasted tuning dials
-        """
         src, dst = edge_index
-
-        # 1. Edge Update
         edge_input = torch.cat([x[src], x[dst], edge_attr], dim=-1)
         edge_attr  = edge_attr + self.edge_mlp(edge_input)
-
-        # 2. Node Update (Message Aggregation)
         agg = self.propagate(edge_index, x=x, edge_attr=edge_attr)
         node_update = self.node_mlp(torch.cat([x, agg], dim=-1))
-
-        # 3. Apply FiLM (Scale & Shift)
         node_update = self.norm(node_update)
         node_update = (gamma * node_update) + beta
-
-        # 4. Residual Connection
         x = x + node_update
         return x, edge_attr
 
@@ -131,20 +99,8 @@ class FiLMMeshBlock(MessagePassing):
 class CrossAttentionLayer(nn.Module):
     """
     Per-vertex gated cross-attention over the CLS style embedding.
-
-    FiLM broadcasts the same gamma/beta to every node uniformly.
-    CrossAttentionLayer lets each node decide how much of the style
-    embedding is relevant to its specific location on the mesh.
-
-    - Hem vertices learn to gate heavily on drape/weight style signals
-    - Collar vertices learn to gate low (structurally fixed regardless of fabric)
-    - Sleeve ends learn to gate on stiffness/fold signals
-
-    Uses sigmoid (not softmax) because each node attends to a single vector,
-    not a sequence — softmax over one element always returns 1.0.
-
-    Sits between selected GNN layers — additive residual on top of FiLM,
-    never replacing it.
+    Lets each node decide how much of the style embedding is relevant
+    to its specific location on the mesh.
     """
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
@@ -155,116 +111,63 @@ class CrossAttentionLayer(nn.Module):
         self.scale  = latent_dim ** -0.5
 
     def forward(self, x, style_emb, batch):
-        """
-        x:         (total_nodes, latent_dim) — current node features
-        style_emb: (B, latent_dim)           — CLS style embedding per graph
-        batch:     (total_nodes,)            — node-to-graph index
-        """
         x_norm = self.norm(x)
-        Q      = self.q_proj(x_norm)              # (total_nodes, latent_dim)
-        K      = self.k_proj(style_emb)[batch]    # (total_nodes, latent_dim)
-        V      = self.v_proj(style_emb)[batch]    # (total_nodes, latent_dim)
-
-        # Scaled dot-product — scalar gate per node
-        attn = (Q * K).sum(dim=-1, keepdim=True) * self.scale  # (total_nodes, 1)
-        attn = torch.sigmoid(attn)                               # gate in [0, 1]
-
-        # Residual — if sigmoid learns to zero out, layer has no effect (safe)
+        Q      = self.q_proj(x_norm)
+        K      = self.k_proj(style_emb)[batch]
+        V      = self.v_proj(style_emb)[batch]
+        attn   = (Q * K).sum(dim=-1, keepdim=True) * self.scale
+        attn   = torch.sigmoid(attn)
         return x + attn * V
 
 
-# ── Automatic Loss Weighter ───────────────────────────────────────────────────
+# ── Automatic Loss Weighter ──────────────────────────────────────────────────
 
 class AutomaticLossWeighter(nn.Module):
-    '''
-    Find the perfect balance between the loss terms to maintain balance
-    - Drape loss, edge strain loss, and classification loss are all scaled based on their values
-    - Does not allow a single loss term to dominate during training
-    - Can set priority values to assign priority between the loss terms
-    '''
-    def __init__(self, num_tasks=3, priors=None):
+    """
+    Dynamically balances N loss terms using learned uncertainty weighting.
+    Accepts variable number of losses via *args — number must match num_tasks.
+    """
+    def __init__(self, num_tasks, priors=None):
         super().__init__()
-        # Initialize log(sigma^2) to 0.
-        # Use log variance for numerical stability (prevents division by zero)
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
-
-        # If no priors are provided, default to equal importance (1.0)
         if priors is None:
             priors = [1.0] * num_tasks
-        # Store the priors as a buffer so they move to the GPU with the model,
-        # but the optimizer knows NOT to train them
         self.register_buffer('priors', torch.tensor(priors, dtype=torch.float32))
 
-    def forward(self, d_loss, e_loss, c_loss):
-        # Gather the raw losses
-        losses = [d_loss, e_loss, c_loss]
+    def forward(self, *losses):
+        assert len(losses) == len(self.log_vars), \
+            f"Expected {len(self.log_vars)} losses, got {len(losses)}"
         total_loss = 0
-
         for i, loss in enumerate(losses):
-            # Calculate precision: exp(-log(sigma^2)) = 1 / sigma^2
             precision = torch.exp(-self.log_vars[i])
-
-            # Apply the uncertainty weighting formula
             task_loss = (precision * loss) + self.log_vars[i]
-            # Multiply the dynamically balanced loss by the static priority weight
             total_loss += self.priors[i] * task_loss
-
         return total_loss
 
 
 # ── V4 Master Architecture ────────────────────────────────────────────────────
 
 class MasterDrapeModel(nn.Module):
-    """
-    V4 upgrade from v3:
-    - CrossAttentionLayer injected at configurable GNN layer indices
-    - Defaults to midpoint and final layer so it works correctly at any gnn_layers value
-    - FiLM conditioning unchanged at all layers
-    - Identical interface to teammate's v3 — gnn_layers is first positional arg
-
-    cross_attn_layers: list of layer indices (0-indexed) where cross-attention is injected.
-        Default None → automatically set to [gnn_layers // 2 - 1, gnn_layers - 1]
-        Example with gnn_layers=6:  [2, 5]  (after layers 3 and 6)
-        Example with gnn_layers=8:  [3, 7]  (after layers 4 and 8)
-        Example with gnn_layers=10: [4, 9]  (after layers 5 and 10)
-        Custom example:             [1, 4, 9] (inject at 3 points)
-
-    One CrossAttentionLayer module is created per injection point — each learns
-    independent Q/K/V projections so different layers can specialize.
-    """
     def __init__(self, gnn_layers, embed_dim=STYLE_DIM, latent_dim=LATENT_DIM,
                  cross_attn_layers=None):
         super().__init__()
 
         self.vit = StyleViT_DINO(embed_dim=embed_dim)
-
         self.node_encoder = build_mlp(NODE_IN_DIM, latent_dim)
         self.edge_encoder = build_mlp(EDGE_IN_DIM, latent_dim)
 
-        # Dedicated FiLM generator MLP for every layer — unchanged from v3
         self.film_generators = nn.ModuleList([
             nn.Linear(GLOBAL_COND_DIM, latent_dim * 2) for _ in range(gnn_layers)
         ])
-
         self.processor = nn.ModuleList([FiLMMeshBlock(latent_dim) for _ in range(gnn_layers)])
 
-        # [V4 NEW] Configurable cross-attention injection points
-        # Default: midpoint layer and final layer — works correctly at any gnn_layers value
         if cross_attn_layers is None:
             cross_attn_layers = [gnn_layers // 2 - 1, gnn_layers - 1]
-
-        # Validate — all indices must be valid layer indices
         for idx in cross_attn_layers:
-            assert 0 <= idx < gnn_layers, (
-                f"cross_attn_layers index {idx} is out of range for gnn_layers={gnn_layers}. "
-                f"Valid range: 0 to {gnn_layers - 1}."
-            )
+            assert 0 <= idx < gnn_layers, \
+                f"cross_attn_layers index {idx} out of range for gnn_layers={gnn_layers}"
 
-        # Store as a set for O(1) lookup in forward()
         self.cross_attn_layers = set(cross_attn_layers)
-
-        # One independent CrossAttentionLayer per injection point
-        # Stored in a dict keyed by layer index so forward() can look them up
         self.cross_attn_modules = nn.ModuleDict({
             str(idx): CrossAttentionLayer(latent_dim)
             for idx in cross_attn_layers
@@ -273,18 +176,11 @@ class MasterDrapeModel(nn.Module):
         self.decoder = nn.Linear(latent_dim, 3)
         self.fabric_classifier = nn.Linear(embed_dim, NUM_FABRIC_FAMILIES)
 
-        # Print injection points on init for visibility
         human_readable = [idx + 1 for idx in sorted(cross_attn_layers)]
-        print(f"  CrossAttention injected after GNN layers: {human_readable} "
-              f"(0-indexed: {sorted(cross_attn_layers)}) "
-              f"out of {gnn_layers} total layers")
+        print(f"  CrossAttention injected after GNN layers: {human_readable}")
 
     def forward(self, data):
-        # 1. Vision Forward
-        style_emb = self.vit(data.image)  # (B, 128)
-
-        # 2. Build Global Conditioning Vector
-        # Pack Style, SMPL, Physics, and Size into one Master Context (B, 150)
+        style_emb = self.vit(data.image)
         global_cond = torch.cat([
             style_emb,
             data.tgt_smpl.view(-1, SMPL_DIM),
@@ -292,38 +188,66 @@ class MasterDrapeModel(nn.Module):
             data.tgt_size.view(-1, SIZE_DIM)
         ], dim=-1)
 
-        # 3. Build Node Features (Pure Geometry Now)
         x = torch.cat([data.pos, data.uvs, data.normals], dim=-1)
-
         x = self.node_encoder(x)
         edge_attr = self.edge_encoder(data.edge_attr)
+        b = data.batch
 
-        b = data.batch  # Node-to-Batch mapping
-
-        # 4. Process Graph with Layer-specific FiLM + Cross-Attention at configured layers
         for i, layer in enumerate(self.processor):
-
-            # FiLM: generate per-layer scale and shift from global context
-            film_params       = self.film_generators[i](global_cond)  # (B, 256)
-            film_params_nodes = film_params[b]                          # (total_nodes, 256)
+            film_params       = self.film_generators[i](global_cond)
+            film_params_nodes = film_params[b]
             gamma, beta       = torch.chunk(film_params_nodes, 2, dim=-1)
-
-            # FiLM-modulated message passing
             x, edge_attr = layer(x, data.edge_index, edge_attr, gamma, beta)
 
-            # [V4 NEW] Cross-attention at configured injection points
-            # FiLM said the same thing to every node — cross-attention lets each
-            # node decide how much of the style signal applies to its location
             if i in self.cross_attn_layers:
                 x = self.cross_attn_modules[str(i)](x, style_emb, b)
 
         predicted_delta = self.decoder(x)
         fabric_logits   = self.fabric_classifier(style_emb)
-
         return predicted_delta, fabric_logits
 
 
-# ── The Physics Triad Loss ───────────────────────────────────────────────────
+# ── Face Adjacency (precompute once at training startup) ─────────────────────
+
+def build_face_adjacency(faces):
+    """
+    Finds all pairs of faces that share an edge.
+    Returns:
+        face_adj:     (num_adj_pairs, 2) — adjacent face index pairs
+        shared_edges: (num_adj_pairs, 2) — vertex indices of the shared edge
+    """
+    edge_to_face = {}
+    adjacency = []
+    shared = []
+
+    for fi in range(len(faces)):
+        for j in range(3):
+            v0 = int(faces[fi][j])
+            v1 = int(faces[fi][(j + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+
+            if edge_key in edge_to_face:
+                adjacency.append([edge_to_face[edge_key], fi])
+                shared.append([edge_key[0], edge_key[1]])
+            else:
+                edge_to_face[edge_key] = fi
+
+    face_adj     = torch.tensor(adjacency, dtype=torch.long)
+    shared_edges = torch.tensor(shared, dtype=torch.long)
+    return face_adj, shared_edges
+
+
+# ── Loss Helper: Face Normals ─────────────────────────────────────────────────
+
+def compute_face_normals(verts, faces):
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+    return F.normalize(normals, dim=1)
+
+
+# ── Loss: Edge Strain ─────────────────────────────────────────────────────────
 
 def compute_edge_strain_loss(pred_pos, gt_pos, edge_index):
     row, col = edge_index
@@ -332,60 +256,113 @@ def compute_edge_strain_loss(pred_pos, gt_pos, edge_index):
     return F.mse_loss(pred_edge_lengths, gt_edge_lengths)
 
 
+# ── Loss: Normal Consistency ──────────────────────────────────────────────────
+
+def compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx):
+    B = batch_idx.max().item() + 1
+    total_loss = 0.0
+    f0, f1 = face_adj[:, 0], face_adj[:, 1]
+
+    for i in range(B):
+        mask  = (batch_idx == i)
+        p_pos = pred_pos[mask]
+        g_pos = gt_pos[mask]
+
+        pred_normals = compute_face_normals(p_pos, faces)
+        gt_normals   = compute_face_normals(g_pos, faces)
+
+        pred_dots = (pred_normals[f0] * pred_normals[f1]).sum(dim=1)
+        gt_dots   = (gt_normals[f0]   * gt_normals[f1]).sum(dim=1)
+
+        total_loss += F.mse_loss(pred_dots, gt_dots)
+
+    return total_loss / B
+
+
+# ── Loss: Bending Energy ──────────────────────────────────────────────────────
+
+def compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx):
+    B = batch_idx.max().item() + 1
+    total_loss = 0.0
+    f0, f1 = face_adj[:, 0], face_adj[:, 1]
+
+    for i in range(B):
+        mask  = (batch_idx == i)
+        p_pos = pred_pos[mask]
+        g_pos = gt_pos[mask]
+
+        pred_normals = compute_face_normals(p_pos, faces)
+        n1_p, n2_p = pred_normals[f0], pred_normals[f1]
+        e_vec_p = p_pos[shared_edges[:, 1]] - p_pos[shared_edges[:, 0]]
+        e_dir_p = F.normalize(e_vec_p, dim=1)
+        sin_p = (torch.cross(n1_p, n2_p, dim=1) * e_dir_p).sum(dim=1)
+        cos_p = (n1_p * n2_p).sum(dim=1)
+        theta_pred = torch.atan2(sin_p, cos_p)
+
+        gt_normals = compute_face_normals(g_pos, faces)
+        n1_g, n2_g = gt_normals[f0], gt_normals[f1]
+        e_vec_g = g_pos[shared_edges[:, 1]] - g_pos[shared_edges[:, 0]]
+        e_dir_g = F.normalize(e_vec_g, dim=1)
+        sin_g = (torch.cross(n1_g, n2_g, dim=1) * e_dir_g).sum(dim=1)
+        cos_g = (n1_g * n2_g).sum(dim=1)
+        theta_gt = torch.atan2(sin_g, cos_g)
+
+        total_loss += F.mse_loss(theta_pred, theta_gt)
+
+    return total_loss / B
+
+
+# ── Loss: Collision Penalty ───────────────────────────────────────────────────
+
 def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002):
-    """
-    Calculates if shirt vertices have clipped inside the SMPL body.
-    Requires body vertices and normals to be passed from the DataLoader.
-    """
-    # Note: A true point-to-surface distance is complex in pure PyTorch.
-    # This is a highly efficient proximity approximation:
-    # 1. Find distance from garment vertices to the nearest body vertex
     distances = torch.cdist(pred_pos, body_pos)
     min_dist, nearest_idx = torch.min(distances, dim=1)
-
-    # 2. Check if the movement vector goes against the body surface normal
-    # (meaning it pushed inside the skin rather than hovering above it)
-    nearest_normals   = body_normals[nearest_idx]
+    nearest_normals = body_normals[nearest_idx]
     direction_vectors = pred_pos - body_pos[nearest_idx]
-    # Dot product < 0 means the garment vertex is behind the body normal (inside)
     inside_mask = (torch.sum(direction_vectors * nearest_normals, dim=1) < 0)
-
-    # 3. Penalize vertices that are inside AND closer than the safety threshold (2mm)
     collision_error = torch.relu(threshold - min_dist[inside_mask])
-
     if collision_error.numel() == 0:
         return torch.tensor(0.0, device=pred_pos.device)
-
     return collision_error.mean()
 
 
-def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
-               fabric_logits, fabric_labels, body_pos=None, body_normals=None,
-               cls_weight=0.1, strain_weight=0.1, collision_weight=1.0):
-    """
-    Note: When using AutomaticLossWeighter, cls_weight and strain_weight are
-    passed as 1.0 and dynamic scaling is handled externally.
-    """
+# ── Combined Loss Function ────────────────────────────────────────────────────
 
-    # 1. Drape (Position MSE)
+def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
+               fabric_logits, fabric_labels,
+               batch_idx=None, faces=None, face_adj=None, shared_edges=None,
+               body_pos=None, body_normals=None,
+               use_normal_consistency=False, use_bending_energy=False,
+               cls_weight=0.1, strain_weight=0.1, collision_weight=1.0,
+               normal_weight=0.1, bending_weight=0.1):
+
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)
     d_loss = (sq_err * loss_weight).mean()
 
     pred_pos = template_pos + predicted_delta
     gt_pos   = template_pos + target_delta
 
-    # 2. Edge Strain
     e_loss = compute_edge_strain_loss(pred_pos, gt_pos, edge_index)
 
-    # 3. Collision Penalty
-    # Conditionally triggered if the dataloader provides body data
     col_loss = torch.tensor(0.0, device=d_loss.device)
     if body_pos is not None and body_normals is not None:
         col_loss = compute_collision_penalty(pred_pos, body_pos, body_normals)
 
-    # 4. Aux Classification
+    n_loss = torch.tensor(0.0, device=d_loss.device)
+    if use_normal_consistency and faces is not None and face_adj is not None and batch_idx is not None:
+        n_loss = compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx)
+
+    b_loss = torch.tensor(0.0, device=d_loss.device)
+    if use_bending_energy and faces is not None and face_adj is not None and shared_edges is not None and batch_idx is not None:
+        b_loss = compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx)
+
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
-    total = d_loss + (strain_weight * e_loss) + (collision_weight * col_loss) + (cls_weight * c_loss)
+    total = (d_loss
+             + strain_weight * e_loss
+             + collision_weight * col_loss
+             + normal_weight * n_loss
+             + bending_weight * b_loss
+             + cls_weight * c_loss)
 
-    return total, d_loss, e_loss, col_loss, c_loss
+    return total, d_loss, e_loss, col_loss, n_loss, b_loss, c_loss
