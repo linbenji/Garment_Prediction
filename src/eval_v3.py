@@ -55,6 +55,21 @@ Step-by-Step Execution Flow:
    - Saves a cumulative accuracy plot (.png), a threshold table (.csv), and a 
      comprehensive metrics summary (.json) to the results directory.
 ===============================================================================
+
+Usage:
+    # Evaluate best checkpoint on test split (quick check)
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt
+
+    # Evaluate on val split
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --split val
+
+    # Evaluate and save meshes for visualisation (RECOMMENDED RUN)
+    # Outputs .obj files (3 samples per fabric family) showing the Template, Prediction, and Ground Truth
+    python eval_v3.py --checkpoint runs/method1_baseline/checkpoints/best.pt --save-meshes
+
+    # Scientific run (with baselines)
+    # This will take slightly longer because it has to load the entire train dataset into memory to calculate the Mean Predictor
+    python eval_v3.py --checkpoint runs/method2_master/checkpoints/best.pt --baselines
 """
 
 import os
