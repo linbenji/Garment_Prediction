@@ -1,7 +1,7 @@
 """
 models_v4_5.py
 
-UnfrozenPatchModel: DINOv2 (LoRA rank=8) + FiLM + Patch Token Cross-Attention
+UnfrozenPatchDrapeModel: DINOv2 (LoRA rank=8) + FiLM + Patch Token Cross-Attention
 
 CHANGES FROM models_v4.py (your current working file, LoRA + CLS cross-attn):
 
@@ -16,7 +16,7 @@ CHANGES FROM models_v4.py (your current working file, LoRA + CLS cross-attn):
        - sigmoid → softmax: attending over a sequence needs competitive attention
        - dot product → bmm: K and V are now 3D, need batched matrix multiply
 
-  3. UnfrozenPatchModel.forward() — three lines change
+  3. UnfrozenPatchDrapeModel.forward() — three lines change
        - Unpack two tensors from self.vit
        - Mean-pool patch tokens for FiLM global conditioning
        - Pass patch_emb (not style_emb) into cross-attention
@@ -300,11 +300,11 @@ class AutomaticLossWeighter(nn.Module):
 
 # ── Master Model ──────────────────────────────────────────────────────────────
 
-class UnfrozenPatchModel(nn.Module):
+class UnfrozenPatchDrapeModel(nn.Module):
     """
     v4.5 — LoRA DINOv2 (rank=8) + FiLM + Patch Token CrossAttention
 
-    CHANGES FROM models_v4.py UnfrozenPatchModel:
+    CHANGES FROM models_v4.py UnfrozenPatchDrapeModel:
 
     __init__:
       - self.vit = StyleViT_DINO_LoRA_Patch(...) instead of StyleViT_DINO_LoRA
