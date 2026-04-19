@@ -48,11 +48,11 @@ from models_v4 import UnfrozenCLSDrapeModel, AutomaticLossWeighter, drape_loss, 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#DATA_ROOT = '/workspace/batch_1500_lean'
-#RUNS_DIR  = '/workspace/runs'
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
-DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
-RUNS_DIR   = r"/Users/Ben/Desktop/runs"
+#DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+#RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
 #DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
 #RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"

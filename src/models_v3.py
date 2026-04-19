@@ -6,7 +6,20 @@ Architecture:
   StyleViT_DINO  : DINOv2-Small (frozen) -> projection head -> 128-dim style
   Context Inject : MLP -> FiLM (Feature-wise Linear Modulation) [Scale & Shift]
   MeshGraphNet   : encode-process-decode with FiLM residuals
-  Losses         : Position MSE + Edge Strain + Normal Consistency + Bending Energy + Collision + Aux Cls
+  Losses         : Position MSE + Edge Strain + Normal Consistency + Bending Energy
+                   + Laplacian Smoothness + Collision + Aux Cls
+
+CHANGES FROM PREVIOUS models_v3.py:
+  1. Added compute_laplacian_loss()
+       Direct mm-space penalty on high-frequency displacement noise.
+       Unlike normal consistency (which vanishes near flat regions), Laplacian
+       stays sensitive to small-amplitude bumpiness in smooth areas — which is
+       where orange-peel artifacts live.
+
+  2. drape_loss() extended with use_laplacian flag and laplacian_weight.
+       Return tuple now has 8 values (was 7): adds lap_loss before c_loss.
+       Old order: total, d, e, col, n, b, c
+       New order: total, d, e, col, n, b, lap, c
 """
 
 import torch
@@ -205,6 +218,52 @@ def compute_edge_strain_loss(pred_pos, gt_pos, edge_index):
     return F.mse_loss(pred_edge_lengths, gt_edge_lengths)
 
 
+# ── Loss: Laplacian Smoothness ────────────────────────────────────────────────
+
+def compute_laplacian_loss(pred_delta, gt_delta, edge_index):
+    """
+    Penalises differences in the discrete (uniform) Laplacian of the
+    displacement field between predicted and GT meshes.
+
+    For each vertex v:
+        L(v) = v - mean(neighbours(v))
+
+    L(pred_delta) measures how much each predicted vertex disagrees with the
+    average of its neighbours. Matching L(gt_delta) forces the prediction to
+    reproduce the same local smoothness/roughness pattern as ground truth.
+
+    Unlike normal consistency (dot-product MSE), this operates directly in mm
+    and does NOT suffer the gradient-vanishing problem near cos(θ)≈1 — so it
+    actively penalises small-amplitude orange-peel noise in flat regions.
+
+    Operates on deltas: L(pred_pos) - L(gt_pos) = L(pred_delta) - L(gt_delta)
+    because the template cancels under the linear Laplacian operator.
+    """
+    row, col = edge_index                      # (2, E), bidirectional
+    N = pred_delta.size(0)
+    D = pred_delta.size(1)
+    device = pred_delta.device
+
+    # Degree of each vertex (number of neighbours)
+    ones = torch.ones(row.size(0), device=device)
+    deg = torch.zeros(N, device=device).scatter_add_(0, row, ones).clamp(min=1)
+
+    # Sum of neighbour delta values for each vertex
+    index = row.unsqueeze(1).expand(-1, D)     # (E, D)
+    pred_sum = torch.zeros_like(pred_delta).scatter_add_(0, index, pred_delta[col])
+    gt_sum   = torch.zeros_like(gt_delta  ).scatter_add_(0, index, gt_delta[col])
+
+    # Mean of neighbours
+    pred_neigh_mean = pred_sum / deg.unsqueeze(1)
+    gt_neigh_mean   = gt_sum   / deg.unsqueeze(1)
+
+    # Laplacian = self - mean(neighbours)
+    pred_lap = pred_delta - pred_neigh_mean
+    gt_lap   = gt_delta   - gt_neigh_mean
+
+    return F.mse_loss(pred_lap, gt_lap)
+
+
 # ── Loss: Normal Consistency ──────────────────────────────────────────────────
 
 def compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx):
@@ -302,15 +361,17 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
                batch_idx=None, faces=None, face_adj=None, shared_edges=None,
                body_pos=None, body_normals=None,
                use_normal_consistency=False, use_bending_energy=False,
+               use_laplacian=False,
                cls_weight=0.1, strain_weight=0.1, collision_weight=1.0,
-               normal_weight=0.1, bending_weight=0.1):
+               normal_weight=0.1, bending_weight=0.1, laplacian_weight=0.1):
     """
     Combined loss with configurable surface quality terms.
 
-    When using AutomaticLossWeighter, set all weights to 1.0 and let
+    When using AutomaticLossWeighter, set all scalar weights to 1.0 and let
     the weighter handle dynamic scaling.
 
-    Returns: total, d_loss, e_loss, col_loss, n_loss, b_loss, c_loss
+    Returns: total, d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
+             (NOTE: return tuple is 8 long now — was 7 before adding laplacian)
     """
 
     # 1. Drape (Position MSE)
@@ -338,14 +399,20 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
     if use_bending_energy and faces is not None and face_adj is not None and shared_edges is not None and batch_idx is not None:
         b_loss = compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx)
 
-    # 6. Aux Classification
+    # 6. Laplacian Smoothness (toggle via flag)  ── NEW
+    lap_loss = torch.tensor(0.0, device=d_loss.device)
+    if use_laplacian:
+        lap_loss = compute_laplacian_loss(predicted_delta, target_delta, edge_index)
+
+    # 7. Aux Classification
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
     total = (d_loss
-             + strain_weight * e_loss
-             + collision_weight * col_loss
-             + normal_weight * n_loss
-             + bending_weight * b_loss
-             + cls_weight * c_loss)
+             + strain_weight     * e_loss
+             + collision_weight  * col_loss
+             + normal_weight     * n_loss
+             + bending_weight    * b_loss
+             + laplacian_weight  * lap_loss
+             + cls_weight        * c_loss)
 
-    return total, d_loss, e_loss, col_loss, n_loss, b_loss, c_loss
+    return total, d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss

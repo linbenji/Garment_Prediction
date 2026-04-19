@@ -1,7 +1,7 @@
 """
 eval_v4.py
 
-Evaluation script for MasterDrapeModel v4 (CLS Cross-Attention) checkpoints.
+Evaluation script for UnfrozenCLSDrapeModel v4 (CLS Cross-Attention) checkpoints.
 
 Computes:
   1. Overall MVE (mean vertex error in mm)
@@ -35,7 +35,7 @@ from torch_geometric.loader import DataLoader
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v4 import MasterDrapeModel
+from models_v4 import UnfrozenCLSDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -322,7 +322,7 @@ def main():
     print(f"Best val loss:    {ckpt.get('best_val_loss', '?'):.4f}")
 
     # Build model — restore cross_attn_layers from saved config
-    model = MasterDrapeModel(
+    model = UnfrozenCLSDrapeModel(
         gnn_layers        = cfg.get('gnn_layers', 8),
         embed_dim         = cfg.get('embed_dim',  128),
         latent_dim        = cfg.get('latent_dim', 128),

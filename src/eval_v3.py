@@ -96,11 +96,11 @@ from models_v3 import MasterDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#DATA_ROOT = '/workspace/batch_1500_lean'
-#RUNS_DIR  = '/workspace/runs'
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
-DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
-RUNS_DIR   = r"/Users/Ben/Desktop/runs"
+#DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+#RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
 FABRIC_FAMILIES = [
     'light_knit', 'medium_knit', 'heavy_knit',
@@ -344,12 +344,14 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
                 by_size[size_name].append(mve)
 
                 # Generalization Buckets
-                if body_id <= 22 and fab_group <= 5:     gen_cond = 'seen_body_seen_mat'
-                elif body_id <= 12 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_val'
-                elif body_id >= 23 and fab_group <= 2:   gen_cond = 'unseen_body_seen_mat_test'
-                elif body_id >= 23 and fab_group == 6:   gen_cond = 'unseen_body_unseen_mat'
-                elif body_id <= 22 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_test'
-                elif body_id >= 23 and fab_group <= 5:   gen_cond = 'unseen_body_seen_mat_val'
+                if body_id <= 22 and fab_group <= 4:     gen_cond = 'seen_body_seen_mat'
+                elif body_id <= 12 and fab_group == 5:   gen_cond = 'seen_body_unseen_mat_val'
+                elif body_id >= 23 and fab_group <= 1:   gen_cond = 'unseen_body_seen_mat_test'
+                elif body_id >= 23 and fab_group == 5:   gen_cond = 'unseen_body_unseen_mat'
+                elif body_id <= 22 and fab_group == 5:   gen_cond = 'seen_body_unseen_mat_test'
+                elif body_id >= 23 and fab_group <= 4:   gen_cond = 'unseen_body_seen_mat_val'
+                else:
+                    gen_cond = 'other'
                 
                 by_gen_condition[gen_cond].append(mve)
 
