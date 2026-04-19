@@ -517,13 +517,14 @@ def main():
         val_metrics = val_epoch(
             model, val_loader, device, cfg, epoch, logger, loss_weighter,
             faces_t, face_adj, shared_edges, split='val')
-
-        scheduler.step(val_metrics['loss'])
+        scheduler.step(val_metrics['mve'])  # ← using MVE for LR scheduling, not loss
+        # scheduler.step(val_metrics['loss'])
         current_lr = optimiser.param_groups[0]['lr']
         logger.log_lr(epoch, current_lr)
         epoch_time = time.time() - epoch_start
-
-        improved = val_metrics['loss'] < best_val_loss
+        # Changed the definition of "improved" to compare val_metrics['mve'] against best_val_loss (which is now effectively best_val_mve) instead of val_metrics['loss']
+        # improved = val_metrics['loss'] < best_val_loss
+        improved = val_metrics['mve'] < best_val_loss
         marker   = " ← best" if improved else ""
 
         print(f"Epoch {epoch:3d}/{cfg['max_epochs']} | "
@@ -560,7 +561,9 @@ def main():
             break
 
     print(f"\n{'='*65}")
-    print(f"TRAINING COMPLETE — Best val loss: {best_val_loss:.6f}")
+    print(f"TRAINING COMPLETE — Best val mve: {best_val_loss:.6f}")
+    # Changed the print statement to reflect that best_val_loss is effectively best_val_mve now, since we're using MVE for LR scheduling and early stopping criteria instead of the original loss.
+    # print(f"TRAINING COMPLETE — Best val loss: {best_val_loss:.6f}")
     with open(os.path.join(run_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     logger.close()
