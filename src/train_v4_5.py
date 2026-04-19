@@ -1,7 +1,7 @@
 """
 train_v4_5.py
 
-Training loop for MasterDrapeModel v4.5
+Training loop for UnfrozenPatchModel v4.5
 LoRA DINOv2 (rank=8) + FiLM + Patch Token Cross-Attention
 
 CHANGES FROM train_v4.py — exactly three things:
@@ -38,7 +38,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v4_5 import MasterDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
+from models_v4_5 import UnfrozenPatchModel, AutomaticLossWeighter, drape_loss, build_face_adjacency  # ← CHANGED
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
