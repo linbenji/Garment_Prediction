@@ -371,12 +371,12 @@ class Logger:
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 
 def save_checkpoint(path, model, optimiser, scheduler, loss_weighter,
-                    epoch, best_val_loss, config, metrics):
+                    epoch, best_val_mve, config, metrics):
     torch.save({
         'epoch': epoch, 'model_state': model.state_dict(),
         'optim_state': optimiser.state_dict(), 'sched_state': scheduler.state_dict(),
         'loss_weighter_state': loss_weighter.state_dict(),
-        'best_val_loss': best_val_loss, 'config': config, 'metrics': metrics,
+        'best_val_mve': best_val_mve, 'config': config, 'metrics': metrics,
     }, path)
 
 def load_checkpoint(path, model, optimiser, scheduler, loss_weighter, device):
@@ -386,8 +386,9 @@ def load_checkpoint(path, model, optimiser, scheduler, loss_weighter, device):
     scheduler.load_state_dict(ckpt['sched_state'])
     if 'loss_weighter_state' in ckpt:
         loss_weighter.load_state_dict(ckpt['loss_weighter_state'])
-    print(f"  Resumed from epoch {ckpt['epoch']}  best_val_loss={ckpt['best_val_loss']:.6f}")
-    return ckpt['epoch'], ckpt['best_val_loss']
+    best = ckpt.get('best_val_mve', ckpt.get('best_val_loss', float('inf')))
+    print(f"  Resumed from epoch {ckpt['epoch']}  best_val_mve={best:.4f}mm")
+    return ckpt['epoch'], best
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -493,11 +494,11 @@ def main():
     logger = Logger(run_dir, cfg, use_wandb=cfg['use_wandb'])
 
     start_epoch   = 1
-    best_val_loss = float('inf')
+    best_val_mve = float('inf')
     no_improve    = 0
 
     if args.resume and os.path.exists(args.resume):
-        start_epoch, best_val_loss = load_checkpoint(
+        start_epoch, best_val_mve = load_checkpoint(
             args.resume, model, optimiser, scheduler, loss_weighter, device)
         start_epoch += 1
 
@@ -528,9 +529,7 @@ def main():
         current_lr = optimiser.param_groups[0]['lr']
         logger.log_lr(epoch, current_lr)
         epoch_time = time.time() - epoch_start
-        # Changed the definition of "improved" to compare val_metrics['mve'] against best_val_loss (which is now effectively best_val_mve) instead of val_metrics['loss']
-        # improved = val_metrics['loss'] < best_val_loss
-        improved = val_metrics['mve'] < best_val_loss
+        improved = val_metrics['mve'] < best_val_mve
 
         marker   = " ← best" if improved else ""
 
@@ -550,27 +549,25 @@ def main():
         history.append(record)
 
         if improved:
-            best_val_loss = val_metrics['loss']
+            best_val_mve = val_metrics['mve']
             no_improve    = 0
             save_checkpoint(os.path.join(ckpt_dir, 'best.pt'),
                             model, optimiser, scheduler, loss_weighter,
-                            epoch, best_val_loss, cfg, val_metrics)
+                            epoch, best_val_mve, cfg, val_metrics)
         else:
             no_improve += 1
 
         if epoch % 10 == 0:
             save_checkpoint(os.path.join(ckpt_dir, f'epoch_{epoch:03d}.pt'),
                             model, optimiser, scheduler, loss_weighter,
-                            epoch, best_val_loss, cfg, val_metrics)
+                            epoch, best_val_mve, cfg, val_metrics)
 
         if no_improve >= cfg['early_stop_patience'] and not debug:
             print(f"\nEarly stopping — no improvement for {cfg['early_stop_patience']} epochs")
             break
 
     print(f"\n{'='*65}")
-    # CHANGED to report best_val_mve instead of best_val_loss in the final message
-    # print(f"TRAINING COMPLETE — Best val loss: {best_val_loss:.6f}")
-    print(f"TRAINING COMPLETE — Best val mve: {best_val_loss:.6f}")
+    print(f"TRAINING COMPLETE — Best val mve: {best_val_mve:.6f}")
     with open(os.path.join(run_dir, 'history.json'), 'w') as f:
         json.dump(history, f, indent=2)
     logger.close()
