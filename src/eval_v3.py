@@ -84,8 +84,13 @@ from torch_geometric.loader import DataLoader
 from scipy.spatial import KDTree
 import matplotlib.pyplot as plt
 import pandas as pd
+import random
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import dataloader_v2
+# Force the dataloader to ONLY use the front-facing angle
+dataloader_v2.CAMERA_ANGLES = ['000']
 from dataloader_v2 import GarmentDataset
 from models_v3 import MasterDrapeModel
 
@@ -111,12 +116,14 @@ FAMILY_GROUP = {
 
 FABRIC_FAMILY_IDX = {f: i for i, f in enumerate(FABRIC_FAMILIES)}
 
+# Global flag to toggle saving a subset (30) vs all (180) meshes per pass
+SUBSET_SAVE = True
+
 # Define what constitutes Great, Good, and Acceptable for each metric
 THRESHOLDS = {
     'mve':       {'great': 5.0,  'good': 10.0, 'acceptable': 20.0},  # mm
     'chamfer':   {'great': 5.0,  'good': 10.0, 'acceptable': 20.0},  # mm
     'hausdorff': {'great': 20.0, 'good': 50.0, 'acceptable': 80.0},  # mm
-    'strain':    {'great': 0.05, 'good': 0.10, 'acceptable': 0.20},  # 5%, 10%, 20%
     'iou':       {'great': 0.90, 'good': 0.80, 'acceptable': 0.70},  # Volume overlap
     'normals':   {'great': 0.95, 'good': 0.90, 'acceptable': 0.80},  # Cosine similarity
 }
@@ -126,6 +133,15 @@ class NumpyEncoder(json.JSONEncoder):
         if hasattr(obj, 'item'):
             return obj.item()
         return super().default(obj)
+    
+# ── Reproducibility Helper ────────────────────────────────────────────────────
+
+def set_deterministic_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # ── Mesh & Geometry Helpers ───────────────────────────────────────────────────
 
@@ -241,7 +257,7 @@ def compute_mean_baseline(train_loader, eval_loader, device):
 # ── Main Evaluation ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, template_verts=None, n_save=3):
+def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, template_verts=None, n_save=3, inputs_per_mesh=3):
     model.eval()
     os.makedirs(results_dir, exist_ok=True)
     mesh_dir = os.path.join(results_dir, 'meshes') if save_meshes else None
@@ -260,78 +276,99 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
 
     print(f"  Evaluating {len(loader.dataset)} samples...")
 
-    for batch in loader:
-        batch = batch.to(device)
-        pred_delta, fabric_logits = model(batch)
+    # Multi-pass loop for 3 inputs per mesh
+    for pass_idx in range(inputs_per_mesh):
+        # Set a deterministic seed for this specific pass
+        # This ensures the random pairs chosen in pass 0 are different from pass 1, 
+        # but completely reproducible every time the script is run
+        pass_seed = 42 + pass_idx
+        set_deterministic_seed(pass_seed)
         
-        # Classification Accuracy
-        preds_cls = fabric_logits.argmax(dim=1)
-        cls_correct += (preds_cls == batch.fabric_family_label).sum().item()
+        print(f"    Pass {pass_idx + 1}/{inputs_per_mesh} (Seed: {pass_seed})...")
 
-        # Pre-calculate Strain on the GPU (much faster)
-        src, dst = batch.edge_index
-        pred_len = torch.norm((batch.pos[src] + pred_delta[src]) - (batch.pos[dst] + pred_delta[dst]), dim=1)
-        gt_len = torch.norm((batch.pos[src] + batch.y[src]) - (batch.pos[dst] + batch.y[dst]), dim=1)
-        batch_strain = torch.abs(pred_len - gt_len) / (gt_len + 1e-9)
+        # Track how many meshes we've processed in the current pass
+        samples_this_pass = 0
 
-        for i in range(batch.num_graphs):
-            # 1. Isolate the specific graph
-            mask = (batch.batch == i)
-            edge_mask = (batch.batch[batch.edge_index[0]] == i)
+        for batch in loader:
+            batch = batch.to(device)
+            pred_delta, fabric_logits = model(batch)
             
-            p_verts = (batch.pos[mask] + pred_delta[mask]).cpu().numpy()
-            g_verts = (batch.pos[mask] + batch.y[mask]).cpu().numpy()
-            
-            # 2. Calculate Core Metrics
-            mve = np.linalg.norm(p_verts - g_verts, axis=1).mean()
-            p90 = np.quantile(np.linalg.norm(p_verts - g_verts, axis=1), 0.90)
-            chamfer, hausdorff = compute_chamfer_hausdorff(p_verts, g_verts)
-            iou = compute_iou(p_verts, g_verts)
-            max_strain = batch_strain[edge_mask].max().item()
+            # Classification Accuracy
+            preds_cls = fabric_logits.argmax(dim=1)
+            cls_correct += (preds_cls == batch.fabric_family_label).sum().item()
 
-            metrics['mve'].append(mve)
-            metrics['p90'].append(p90)
-            metrics['chamfer'].append(chamfer)
-            metrics['hausdorff'].append(hausdorff)
-            metrics['iou'].append(iou)
-            metrics['strain'].append(max_strain)
-            
-            if faces is not None:
-                metrics['normals'].append(compute_normals_sim(p_verts, g_verts, faces))
+            # Pre-calculate Strain on the GPU (much faster)
+            src, dst = batch.edge_index
+            pred_len = torch.norm((batch.pos[src] + pred_delta[src]) - (batch.pos[dst] + pred_delta[dst]), dim=1)
+            gt_len = torch.norm((batch.pos[src] + batch.y[src]) - (batch.pos[dst] + batch.y[dst]), dim=1)
+            batch_strain = torch.abs(pred_len - gt_len) / (gt_len + 1e-9)
 
-            # 3. Categorization & Metadata
-            body_id = batch.body_id[i].item()
-            fab_label = batch.fabric_family_label[i].item()
-            fab_name = FABRIC_FAMILIES[fab_label] if fab_label < len(FABRIC_FAMILIES) else 'unknown'
-            fab_group = FAMILY_GROUP.get(fab_name, 0)
-            
-            size_enc = batch.tgt_size.view(-1, 2)[i]
-            width_pct = round(size_enc[0].item(), 2)
-            size_name = {0.92: 'small', 1.0: 'medium', 1.08: 'large', 1.17: 'xl', 1.28: 'xxl'}.get(width_pct, f'w={width_pct}')
+            for i in range(batch.num_graphs):
+                # 1. Isolate the specific graph
+                mask = (batch.batch == i)
+                edge_mask = (batch.batch[batch.edge_index[0]] == i)
+                
+                p_verts = (batch.pos[mask] + pred_delta[mask]).cpu().numpy()
+                g_verts = (batch.pos[mask] + batch.y[mask]).cpu().numpy()
+                
+                # 2. Calculate Core Metrics
+                mve = np.linalg.norm(p_verts - g_verts, axis=1).mean()
+                p90 = np.quantile(np.linalg.norm(p_verts - g_verts, axis=1), 0.90)
+                chamfer, hausdorff = compute_chamfer_hausdorff(p_verts, g_verts)
+                iou = compute_iou(p_verts, g_verts)
+                max_strain = batch_strain[edge_mask].max().item()
+                avg_strain = batch_strain[edge_mask].mean().item()
 
-            by_family[fab_name].append(mve)
-            by_size[size_name].append(mve)
+                metrics['mve'].append(mve)
+                metrics['p90'].append(p90)
+                metrics['chamfer'].append(chamfer)
+                metrics['hausdorff'].append(hausdorff)
+                metrics['iou'].append(iou)
+                metrics['strain'].append(max_strain)
+                metrics['avg_strain'].append(avg_strain)
+                
+                if faces is not None:
+                    metrics['normals'].append(compute_normals_sim(p_verts, g_verts, faces))
 
-            # Generalization Buckets
-            if body_id <= 22 and fab_group <= 5:     gen_cond = 'seen_body_seen_mat'
-            elif body_id <= 12 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_val'
-            elif body_id <= 22 and fab_group == 6:   gen_cond = 'seen_body_unseen_mat_test'
-            elif body_id >= 23 and fab_group <= 2:   gen_cond = 'unseen_body_seen_mat_val'
-            elif body_id >= 23 and fab_group <= 5:   gen_cond = 'unseen_body_seen_mat_test'
-            else:                                    gen_cond = 'unseen_body_unseen_mat'
-            by_gen_condition[gen_cond].append(mve)
+                # 3. Categorization & Metadata
+                body_id = batch.body_id[i].item()
+                fab_label = batch.fabric_family_label[i].item()
+                fab_name = FABRIC_FAMILIES[fab_label] if fab_label < len(FABRIC_FAMILIES) else 'unknown'
+                fab_group = FAMILY_GROUP.get(fab_name, 0)
+                
+                size_enc = batch.tgt_size.view(-1, 2)[i]
+                width_pct = round(size_enc[0].item(), 2)
+                size_name = {0.92: 'small', 1.0: 'medium', 1.08: 'large', 1.17: 'xl', 1.28: 'xxl'}.get(width_pct, f'w={width_pct}')
 
-            metrics['body_id'].append(body_id)
-            metrics['fab_label'].append(fab_label)
+                by_family[fab_name].append(mve)
+                by_size[size_name].append(mve)
 
-            # 4. Save Meshes
-            if save_meshes and saved_per_family[fab_name] < n_save:
-                prefix = f"body{body_id:03d}_{fab_name}_{size_name}_mve{mve:.1f}mm"
-                save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"), p_verts, faces)
-                save_obj(os.path.join(mesh_dir, f"{prefix}_gt.obj"), g_verts, faces)
-                saved_per_family[fab_name] += 1
+                # Generalization Buckets
+                if body_id <= 22 and fab_group <= 4:     gen_cond = 'seen_body_seen_mat'
+                elif body_id <= 12 and fab_group == 5:   gen_cond = 'seen_body_unseen_mat_val'
+                elif body_id >= 23 and fab_group <= 1:   gen_cond = 'unseen_body_seen_mat_test'
+                elif body_id >= 23 and fab_group == 5:   gen_cond = 'unseen_body_unseen_mat'
+                elif body_id <= 22 and fab_group == 5:   gen_cond = 'seen_body_unseen_mat_test'
+                elif body_id >= 23 and fab_group <= 4:   gen_cond = 'unseen_body_seen_mat_val'
+                
+                by_gen_condition[gen_cond].append(mve)
 
-            total_samples += 1
+                metrics['body_id'].append(body_id)
+                metrics['fab_label'].append(fab_label)
+
+                # Save meshes (Check if we should save based on the SUBSET_SAVE flag)
+                if save_meshes and (not SUBSET_SAVE or samples_this_pass < 30):
+                    # Added 'pass_idx' to the filename so 3 different 
+                    # random input pairings don't overwrite each other
+                    prefix = f"body{body_id:03d}_{fab_name}_{size_name}_pass{pass_idx}_mve{mve:.1f}mm"
+                    
+                    # Save Prediction and Ground Truth only
+                    save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"), p_verts, faces)
+                    save_obj(os.path.join(mesh_dir, f"{prefix}_gt.obj"), g_verts, faces)
+
+                total_samples += 1
+                samples_this_pass += 1
+
 
     # ── Post-Processing & Tables ──────────────────────────────────────────────
     
@@ -360,21 +397,51 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
     df = pd.DataFrame(table_data)
     df.to_csv(os.path.join(results_dir, 'threshold_performance.csv'), index=False)
 
-    # 4. Cumulative Accuracy Plot
-    plt.figure(figsize=(10, 6))
-    for m_name in ['mve', 'chamfer', 'hausdorff']:
-        sorted_data = np.sort(metrics[m_name])
-        y = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
-        plt.plot(sorted_data, y, label=f'{m_name.upper()}')
+    # ── Individual Plots ──────────────────────────────────────────────────────
+
+    # Define all metrics to plot. 
+    # (Normals is appended conditionally to prevent crashes if faces.npy is missing)
+    plot_metrics = ['mve', 'chamfer', 'hausdorff', 'strain', 'avg_strain', 'iou']
+    if 'normals' in metrics and len(metrics['normals']) > 0:
+        plot_metrics.append('normals')
     
-    plt.axvline(x=10, color='r', linestyle='--', alpha=0.5, label='10mm Threshold')
-    plt.xlabel('Error Distance (mm)')
-    plt.ylabel('Fraction of Test Set (Accuracy)')
-    plt.title('Cumulative Accuracy (Distance Metrics)')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(results_dir, 'cumulative_accuracy.png'), dpi=300)
-    plt.close()
+    for m_name in plot_metrics:
+        plt.figure(figsize=(10, 6))
+        # Sort the data to create a Cumulative Distribution Function (CDF)
+        sorted_data = np.sort(metrics[m_name])
+        # Fraction of Test Set / Accuracy
+        x_frac = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
+        
+        plt.plot(x_frac, sorted_data, label=f'{m_name.upper()}', color='blue')
+        
+        # Add visual reference lines and dynamic X-axis labels
+        if m_name in ['mve', 'chamfer']:
+            plt.axhline(y=10, color='red', linestyle='--', alpha=0.5, label='10mm Threshold (Good)')
+            y_label = 'Error Distance (mm)'
+        elif m_name == 'hausdorff':
+            plt.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='50mm Threshold (Good)')
+            y_label = 'Error Distance (mm)'
+        elif m_name in ['strain', 'avg_strain']:
+            plt.axhline(y=0.10, color='red', linestyle='--', alpha=0.5, label='10% Strain Threshold (Good)')
+            y_label = 'Strain Ratio'
+        elif m_name == 'iou':
+            plt.axhline(y=0.80, color='red', linestyle='--', alpha=0.5, label='80% IoU Threshold (Good)')
+            y_label = 'Intersection over Union (IoU)'
+        elif m_name == 'normals':
+            plt.axhline(y=0.90, color='red', linestyle='--', alpha=0.5, label='0.90 Cosine Sim Threshold (Good)')
+            y_label = 'Cosine Similarity'
+
+        plt.xlabel('Fraction of Test Set (Accuracy Cumulative)')
+        plt.ylabel(y_label)
+        plt.title(f'Cumulative Accuracy: {m_name.upper()}')
+        # Adjust legend location so it doesn't block the curve
+        loc = 'upper left' if m_name in ['iou', 'normals'] else 'upper right'
+        plt.legend(loc=loc)
+        plt.grid(True)
+        
+        plot_path = os.path.join(results_dir, f'cumulative_accuracy_{m_name}.png')
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
 
     return final_stats, df, by_family, by_size, by_gen_condition
 
@@ -391,14 +458,15 @@ def print_results(stats, df, by_family, by_size, by_gen, baselines):
     print(f"  Hausdorff Distance:      {stats['hausdorff']:.2f} mm")
     print(f"  Mesh Silhouette IoU:     {stats['iou']:.1%}")
     if 'normals' in stats:
-        print(f"  Normal Consistency:      {stats['normals']:.3f} (cosine sim)")
+        print(f"  Normal Consistency:  {stats['normals']:.3f} (cosine sim)")
     print(f"  Max Edge Strain:         {stats['strain']:.1%}")
+    print(f"  Avg Edge Strain:         {stats['avg_strain']:.1%}")
 
     if baselines:
         print(f"\n── Baselines ──")
         print(f"  Zero Predictor MVE:      {baselines['zero']:.2f} mm")
         if 'mean' in baselines:
-            print(f"  Mean Predictor MVE:      {baselines['mean']:.2f} mm")
+            print(f"  Mean Predictor MVE:  {baselines['mean']:.2f} mm")
 
     print(f"\n── Threshold Success Rates ──")
     print(df.to_string(index=False))
@@ -424,6 +492,9 @@ def main():
     parser.add_argument('--baselines', action='store_true', help='Compute zero/mean baselines (slower)')
     args = parser.parse_args()
 
+    # Set overall main seed
+    set_deterministic_seed(42)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device} | Checkpoint: {args.checkpoint}")
 
@@ -443,7 +514,8 @@ def main():
     
     # Load Data
     eval_ds = GarmentDataset(DATA_ROOT, split=args.split, augment=False)
-    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False)
+    # Important: num_workers=0 ensures our manual seed overrides apply cleanly in the main thread
+    eval_loader = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Load Faces
     faces_path = os.path.join(DATA_ROOT, 'template', 'faces.npy')
@@ -466,12 +538,15 @@ def main():
     print("\nStarting comprehensive evaluation...")
     stats, df, by_family, by_size, by_gen = evaluate(
         model, eval_loader, device, results_dir, 
-        save_meshes=args.save_meshes, faces=faces
+        save_meshes=args.save_meshes, faces=faces, inputs_per_mesh=3
     )
+
+    rounded_stats = {k: round(v, 3) if isinstance(v, float) else v for k, v in stats.items()}
+    rounded_baselines = {k: round(v, 3) if isinstance(v, float) else v for k, v in baselines.items()}
 
     # Save and Print
     with open(os.path.join(results_dir, 'summary_stats.json'), 'w') as f:
-        json.dump({**stats, 'baselines': baselines}, f, indent=2, cls=NumpyEncoder)
+        json.dump({**rounded_stats, 'baselines': rounded_baselines}, f, indent=2, cls=NumpyEncoder)
 
     print_results(stats, df, by_family, by_size, by_gen, baselines)
     print(f"\nAll plots and tables saved to: {results_dir}")
