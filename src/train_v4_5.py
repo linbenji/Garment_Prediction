@@ -62,7 +62,7 @@ CONFIG = {
 
     # Training
     'max_epochs':      2   if DEBUG else 100,
-    'early_stop_patience': 15,
+    'early_stop_patience': 30, # Was 15 now 30
     'grad_clip':       1.0,
 
     # Optimiser
@@ -70,7 +70,7 @@ CONFIG = {
     'weight_decay':    1e-4,
 
     # Scheduler
-    'lr_patience':     5,
+    'lr_patience':     8, # Was 5 now 8
     'lr_factor':       0.5,
     'lr_min':          1e-6,
 
@@ -472,10 +472,16 @@ def main():
     print(f"  Parameters: {total:,} total  {trainable:,} trainable  {frozen:,} frozen")
 
     # ── Optimiser & Scheduler ─────────────────────────────────────────────────
+    lora_params  = [p for n, p in model.named_parameters()
+                    if p.requires_grad and 'lora' in n]
+    other_params = [p for n, p in model.named_parameters()
+                    if p.requires_grad and 'lora' not in n]
+
     optimiser = AdamW([
-        {'params': filter(lambda p: p.requires_grad, model.parameters())},
+        {'params': other_params,               'weight_decay': cfg['weight_decay']},
+        {'params': lora_params,                'weight_decay': 0.0},
         {'params': loss_weighter.parameters(), 'weight_decay': 0.0},
-    ], lr=cfg['lr'], weight_decay=cfg['weight_decay'])
+    ], lr=cfg['lr'])
     scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=cfg['lr_patience'],
                                   factor=cfg['lr_factor'], min_lr=cfg['lr_min'], threshold=0.01)
 
