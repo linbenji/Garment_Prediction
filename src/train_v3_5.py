@@ -80,16 +80,16 @@ CONFIG = {
     # + laplacian if enabled
     'prior_drape':    1.0,  # Global position
     'prior_strain':   0.5,  # Increased to enforce asymmetric buckling
-    'prior_normal':   2.0,  # High priority for wrinkles
-    'prior_laplacian': 0.5, # Smoothness/noise suppression
-    'prior_collision': 1.5, # Force fabric outside skin
+    'prior_normal':   3.0,  # High priority for wrinkles
+    'prior_laplacian': 0.3, # Smoothness/noise suppression
+    'prior_collision': 2.0, # Force fabric outside skin
     'prior_cls':      0.1,
 
     # If True, freeze the AutomaticLossWeighter's log_vars so the priors above
     # are the *final* effective weights, not just starting values. Use for
     # diagnostic runs where you want a sustained intervention (e.g. 10x
     # prior_normal) instead of a transient kick the weighter will adapt away.
-    'freeze_weighter': True,
+    'freeze_weighter': False,
 
     # Logging
     'log_every':       10,
@@ -177,9 +177,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
                 batch_idx=batch.batch, faces=faces_t,
                 body_ids=batch.body_id, get_body_data=get_body_data,
                 use_normal_consistency=config['use_normal_consistency'],
-                use_laplacian=config.get('use_laplacian', False),
-                cls_weight=1.0, strain_weight=1.0,
-                normal_weight=1.0, laplacian_weight=1.0,
+                use_laplacian=config.get('use_laplacian', False)
             )
 
             # COMBINE LOSSES
@@ -274,9 +272,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
             batch_idx=batch.batch, faces=faces_t,
             body_ids=batch.body_id, get_body_data=get_body_data,
             use_normal_consistency=config['use_normal_consistency'],
-            use_laplacian=config.get('use_laplacian', False),
-            cls_weight=1.0, strain_weight=1.0,
-            normal_weight=1.0, laplacian_weight=1.0,
+            use_laplacian=config.get('use_laplacian', False)
         )
 
         # COMBINE LOSSES
