@@ -129,9 +129,9 @@ def process_directory(directory, template_path, iterations, lambda_val):
         if filename.endswith('_pred.obj') and not filename.endswith('_gt.obj'): # explicit safety checks
             input_path = os.path.join(directory, filename)
 
-            # Construct output filename by inserting '_smoothed' before '.obj'
+            # Construct output filename by inserting '_processed' before '.obj'
             base_name, _ = os.path.splitext(filename)
-            output_filename = f"{base_name}_smoothed.obj"
+            output_filename = f"{base_name}_processed.obj"
             output_path = os.path.join(directory, output_filename)
 
             # Smooth and save, leaving _gt.obj meshes untouched
