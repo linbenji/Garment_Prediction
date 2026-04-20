@@ -207,22 +207,24 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
         total_strain += e_loss.item()
         total_normal += n_loss.item()
         total_lap    += lap_loss.item()
+        total_col    += col_loss.item()
         total_mve    += mve
         n_batches    += 1
 
         if (batch_idx + 1) % config['log_every'] == 0:
             avg_loss = total_loss / n_batches
             avg_mve  = total_mve  / n_batches
+            avg_col  = total_col  / n_batches
             elapsed  = time.time() - start_time
             print(f"  Epoch {epoch:3d} | Batch {batch_idx+1:4d}/{len(loader)} | "
-                  f"loss={avg_loss:.4f}  mve={avg_mve:.2f}mm  t={elapsed:.1f}s")
+                  f"loss={avg_loss:.4f}  mve={avg_mve:.2f}mm  col={avg_col:.4f}mm t={elapsed:.1f}s")
 
             if logger:
                 step = (epoch - 1) * len(loader) + batch_idx
                 logger.log_train(step, avg_loss, total_drape/n_batches,
                                  total_cls/n_batches, total_strain/n_batches,
                                  avg_mve, total_normal/n_batches,
-                                 total_lap/n_batches)
+                                 total_lap/n_batches, total_col/n_batches)
 
     if n_batches == 0:
         return {k: float('nan') for k in
@@ -235,6 +237,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
         'strain':    total_strain / n_batches,
         'normal':    total_normal / n_batches,
         'laplacian': total_lap    / n_batches,
+        'collision': total_col    / n_batches,
         'mve':       total_mve    / n_batches,
     }
 
@@ -253,6 +256,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
     total_strain = 0.0
     total_normal = 0.0
     total_lap    = 0.0
+    total_col    = 0.0
     total_mve    = 0.0
     n_batches    = 0
 
@@ -290,6 +294,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
         total_strain += e_loss.item()
         total_normal += n_loss.item()
         total_lap    += lap_loss.item()
+        total_col    += col_loss.item()
         total_mve    += mve
         n_batches    += 1
 
@@ -307,7 +312,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
 
     if n_batches == 0:
         return {k: float('nan') for k in
-                ['loss','drape','cls','strain','normal','bending','laplacian','mve']}
+                ['loss','drape','cls','strain','normal','bending','laplacian','collision','mve']}
 
     results = {
         'loss':      total_loss   / n_batches,
@@ -316,6 +321,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
         'strain':    total_strain / n_batches,
         'normal':    total_normal / n_batches,
         'laplacian': total_lap    / n_batches,
+        'collision': total_col    / n_batches,
         'mve':       total_mve    / n_batches,
     }
 
@@ -356,7 +362,7 @@ class Logger:
                 self.use_wandb = False
 
     def log_train(self, step, loss, drape, cls, strain, mve,
-                  normal=0, laplacian=0):
+                  normal=0, laplacian=0, collision=0):
         if self.tb_writer:
             self.tb_writer.add_scalar('train/loss',           loss,      step)
             self.tb_writer.add_scalar('train/drape_loss',     drape,     step)
@@ -364,12 +370,13 @@ class Logger:
             self.tb_writer.add_scalar('train/strain_loss',    strain,    step)
             self.tb_writer.add_scalar('train/normal_loss',    normal,    step)
             self.tb_writer.add_scalar('train/laplacian_loss', laplacian, step)
+            self.tb_writer.add_scalar('train/collision_loss', collision, step)
             self.tb_writer.add_scalar('train/mve_mm',         mve,       step)
         if self.use_wandb:
             import wandb
             wandb.log({'train/loss': loss, 'train/drape': drape, 'train/cls': cls,
                        'train/strain': strain, 'train/normal': normal,
-                       'train/laplacian': laplacian,
+                       'train/laplacian': laplacian, 'train/collision': collision,
                        'train/mve': mve, 'step': step})
 
     def log_val(self, epoch, results, split='val'):

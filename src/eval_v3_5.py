@@ -128,6 +128,7 @@ THRESHOLDS = {
     'hausdorff': {'great': 20.0, 'good': 50.0, 'acceptable': 80.0},  # mm
     'iou':       {'great': 0.90, 'good': 0.80, 'acceptable': 0.70},  # Volume overlap
     'normals':   {'great': 0.95, 'good': 0.90, 'acceptable': 0.80},  # Cosine similarity
+    'collision': {'great': 0.1,  'good': 0.5,  'acceptable': 2.0},   # mm penetration
 }
 
 class NumpyEncoder(json.JSONEncoder):
@@ -259,7 +260,7 @@ def compute_mean_baseline(train_loader, eval_loader, device):
 # ── Main Evaluation ───────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, template_verts=None, n_save=3, inputs_per_mesh=3):
+def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, get_body_data=None, inputs_per_mesh=3):
     model.eval()
     os.makedirs(results_dir, exist_ok=True)
     mesh_dir = os.path.join(results_dir, 'meshes') if save_meshes else None
@@ -312,6 +313,17 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
                 
                 p_verts = (batch.pos[mask] + pred_delta[mask]).cpu().numpy()
                 g_verts = (batch.pos[mask] + batch.y[mask]).cpu().numpy()
+
+                # --- COLLISION CALCULATION ---
+                if get_body_data is not None:
+                    body_id = batch.body_id[i].item()
+                    b_pos, b_norm = get_body_data(body_id, device)
+                    
+                    # Import the function from models_v3_5
+                    from models_v3_5 import compute_collision_penalty
+                    # We use threshold=0 here to measure pure raw penetration depth
+                    col_val = compute_collision_penalty(p_verts, b_pos, b_norm, threshold=0.0)
+                    metrics['collision'].append(col_val.item())
                 
                 # 2. Calculate Core Metrics
                 mve = np.linalg.norm(p_verts - g_verts, axis=1).mean()
@@ -432,6 +444,9 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
         elif m_name == 'normals':
             plt.axhline(y=0.90, color='red', linestyle='--', alpha=0.5, label='0.90 Cosine Sim Threshold (Good)')
             y_label = 'Cosine Similarity'
+        elif m_name == 'collision':
+            plt.axhline(y=0.5, color='red', linestyle='--', alpha=0.5, label='0.5mm (Good)')
+            y_label = 'Avg Penetration Depth (mm)'
 
         plt.xlabel('Fraction of Test Set (Accuracy Cumulative)')
         plt.ylabel(y_label)
@@ -463,6 +478,7 @@ def print_results(stats, df, by_family, by_size, by_gen, baselines):
         print(f"  Normal Consistency:  {stats['normals']:.3f} (cosine sim)")
     print(f"  Max Edge Strain:         {stats['strain']:.1%}")
     print(f"  Avg Edge Strain:         {stats['avg_strain']:.1%}")
+    print(f"  Avg Penetration (Col):   {stats['collision']:.4f} mm")
 
     if baselines:
         print(f"\n── Baselines ──")
@@ -536,11 +552,22 @@ def main():
         train_loader = DataLoader(GarmentDataset(DATA_ROOT, split='train', augment=False), batch_size=args.batch_size)
         baselines['mean'] = compute_mean_baseline(train_loader, eval_loader, device)
 
+    # ── Precompute Body Cache ──
+    body_cache = {}
+    def get_body_data(body_id, device):
+        if body_id not in body_cache:
+            path = os.path.join(DATA_ROOT, 'template', 'bodies', f'body_{body_id:03d}.pt')
+            if not os.path.exists(path): return None
+            data = torch.load(path, map_location=device, weights_only=True)
+            body_cache[body_id] = (data['pos'], data['normals'])
+        return body_cache[body_id]
+
     # Evaluate
     print("\nStarting comprehensive evaluation...")
     stats, df, by_family, by_size, by_gen = evaluate(
         model, eval_loader, device, results_dir, 
-        save_meshes=args.save_meshes, faces=faces, inputs_per_mesh=3
+        save_meshes=args.save_meshes, faces=faces,
+        get_body_data=get_body_data, inputs_per_mesh=3
     )
 
     rounded_stats = {k: round(v, 3) if isinstance(v, float) else v for k, v in stats.items()}
