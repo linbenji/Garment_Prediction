@@ -43,9 +43,9 @@ Key Architectural Features:
      compression, forcing the fabric to buckle into realistic folds.
    - Collision Penalty: Corrected logic that uses body surface normals to 
      force fabric outside the skin, creating physical pressure.
-   - Normal Consistency: High-priority cosine similarity to ensure wrinkles 
-     face the correct physical direction.
-   - Bending Energy: Dihedral angle penalty to maintain soft fabric sweeps.
+   - Normal Consistency and Bending Energy:
+     High-priority cosine similarity to ensure wrinkles face the correct physical direction.
+     Dihedral angle penalty to maintain soft fabric sweeps.
    - Laplacian Smoothness: MM-space penalty to eliminate 'orange-peel' mesh 
      noise and jittery vertices.
    - Aux Classification: Forces the backbone to distinguish material families.
@@ -56,6 +56,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
+from pykeops.torch import LazyTensor
+from pytorch3d.structures import Meshes
+from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
 
 # ── Dimensions ───────────────────────────────────────────────────────────────
 
@@ -184,7 +187,19 @@ class UVRefinementNet(nn.Module):
         coords = (uvs * (self.res - 1)).long()
         for i in range(B):
             mask = (batch_idx == i)
-            grid[i, :, coords[mask, 1], coords[mask, 0]] = x[mask].t()
+            y_idx = coords[mask, 1]
+            x_idx = coords[mask, 0]
+            
+            # Create a tuple of indices for the (C, H, W) grid
+            # We broadcast the channel dimension to match the nodes
+            C = x.size(1)
+            num_nodes = mask.sum().item()
+            c_idx = torch.arange(C, device=x.device).view(C, 1).expand(C, num_nodes)
+            y_idx_expand = y_idx.view(1, num_nodes).expand(C, num_nodes)
+            x_idx_expand = x_idx.view(1, num_nodes).expand(C, num_nodes)
+            
+            # Safely accumulate features without overwriting overlapping UVs
+            grid[i].index_put_((c_idx, y_idx_expand, x_idx_expand), x[mask].t(), accumulate=True)
             
         refinement_map = self.net(grid) # (B, 3, res, res)
         
@@ -274,47 +289,6 @@ class NonbelieverDrapeModel(nn.Module):
         return base_delta + fine_delta, fabric_logits
 
 
-# ── Face Adjacency (precompute once at training startup) ─────────────────────
-
-def build_face_adjacency(faces):
-    """
-    Finds all pairs of faces that share an edge.
-    Returns:
-        face_adj:     (num_adj_pairs, 2) — adjacent face index pairs
-        shared_edges: (num_adj_pairs, 2) — vertex indices of the shared edge
-    """
-    edge_to_face = {}
-    adjacency = []
-    shared = []
-
-    for fi in range(len(faces)):
-        for j in range(3):
-            v0 = int(faces[fi][j])
-            v1 = int(faces[fi][(j + 1) % 3])
-            edge_key = (min(v0, v1), max(v0, v1))
-
-            if edge_key in edge_to_face:
-                adjacency.append([edge_to_face[edge_key], fi])
-                shared.append([edge_key[0], edge_key[1]])
-            else:
-                edge_to_face[edge_key] = fi
-
-    face_adj     = torch.tensor(adjacency, dtype=torch.long)
-    shared_edges = torch.tensor(shared, dtype=torch.long)
-    return face_adj, shared_edges
-
-
-# ── Loss Helper: Face Normals ─────────────────────────────────────────────────
-
-def compute_face_normals(verts, faces):
-    """Unit face normals for a single graph. verts: (N,3), faces: (F,3) long."""
-    v0 = verts[faces[:, 0]]
-    v1 = verts[faces[:, 1]]
-    v2 = verts[faces[:, 2]]
-    normals = torch.cross(v1 - v0, v2 - v0, dim=1)
-    return F.normalize(normals, dim=1)
-
-
 # ── Loss: Edge Strain (Asymmetric) ────────────────────────────────────────────
 
 def compute_edge_strain_loss(pred_pos, gt_pos, edge_index, w_ext=5.0, w_comp=0.5):
@@ -328,133 +302,36 @@ def compute_edge_strain_loss(pred_pos, gt_pos, edge_index, w_ext=5.0, w_comp=0.5
     return strain_sq.mean()
 
 
-# ── Loss: Laplacian Smoothness ────────────────────────────────────────────────
-
-def compute_laplacian_loss(pred_delta, gt_delta, edge_index):
-    """
-    Penalises differences in the discrete (uniform) Laplacian of the
-    displacement field between predicted and GT meshes.
-
-    For each vertex v:
-        L(v) = v - mean(neighbours(v))
-
-    L(pred_delta) measures how much each predicted vertex disagrees with the
-    average of its neighbours. Matching L(gt_delta) forces the prediction to
-    reproduce the same local smoothness/roughness pattern as ground truth.
-
-    Unlike normal consistency (dot-product MSE), this operates directly in mm
-    and does NOT suffer the gradient-vanishing problem near cos(θ)≈1 — so it
-    actively penalises small-amplitude orange-peel noise in flat regions.
-
-    Operates on deltas: L(pred_pos) - L(gt_pos) = L(pred_delta) - L(gt_delta)
-    because the template cancels under the linear Laplacian operator.
-    """
-    row, col = edge_index                      # (2, E), bidirectional
-    N = pred_delta.size(0)
-    D = pred_delta.size(1)
-    device = pred_delta.device
-
-    # Degree of each vertex (number of neighbours)
-    ones = torch.ones(row.size(0), device=device)
-    deg = torch.zeros(N, device=device).scatter_add_(0, row, ones).clamp(min=1)
-
-    # Sum of neighbour delta values for each vertex
-    index = row.unsqueeze(1).expand(-1, D)     # (E, D)
-    pred_sum = torch.zeros_like(pred_delta).scatter_add_(0, index, pred_delta[col])
-    gt_sum   = torch.zeros_like(gt_delta  ).scatter_add_(0, index, gt_delta[col])
-
-    # Mean of neighbours
-    pred_neigh_mean = pred_sum / deg.unsqueeze(1)
-    gt_neigh_mean   = gt_sum   / deg.unsqueeze(1)
-
-    # Laplacian = self - mean(neighbours)
-    pred_lap = pred_delta - pred_neigh_mean
-    gt_lap   = gt_delta   - gt_neigh_mean
-
-    return F.mse_loss(pred_lap, gt_lap)
-
-
-# ── Loss: Normal Consistency ──────────────────────────────────────────────────
-
-def compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx):
-    """
-    Penalizes differences in surface curvature between predicted and GT.
-    For each pair of adjacent faces, computes dot product of their normals.
-    MSE between predicted and GT dot products forces the model to reproduce
-    the same fold pattern — smooth where GT is smooth, folded where GT folds.
-    """
-    B = batch_idx.max().item() + 1
-    total_loss = 0.0
-    f0, f1 = face_adj[:, 0], face_adj[:, 1]
-
-    for i in range(B):
-        mask  = (batch_idx == i)
-        p_pos = pred_pos[mask]
-        g_pos = gt_pos[mask]
-
-        pred_normals = compute_face_normals(p_pos, faces)
-        gt_normals   = compute_face_normals(g_pos, faces)
-
-        pred_dots = (pred_normals[f0] * pred_normals[f1]).sum(dim=1)
-        gt_dots   = (gt_normals[f0]   * gt_normals[f1]).sum(dim=1)
-
-        total_loss += F.mse_loss(pred_dots, gt_dots)
-
-    return total_loss / B
-
-
-# ── Loss: Bending Energy ──────────────────────────────────────────────────────
-
-def compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx):
-    """
-    Penalizes differences in signed dihedral angles between predicted and GT.
-
-    Unlike normal consistency (which uses unsigned dot products), bending energy
-    uses the full signed dihedral angle via atan2. This distinguishes between
-    inward and outward folds — a concave fold and a convex fold at the same angle
-    score differently, which is important for fabric that has a preferred bending direction.
-    """
-    B = batch_idx.max().item() + 1
-    total_loss = 0.0
-    f0, f1 = face_adj[:, 0], face_adj[:, 1]
-
-    for i in range(B):
-        mask  = (batch_idx == i)
-        p_pos = pred_pos[mask]
-        g_pos = gt_pos[mask]
-
-        # ── Predicted dihedral angles ─────────────────────────────────────
-        pred_normals = compute_face_normals(p_pos, faces)
-        n1_p, n2_p = pred_normals[f0], pred_normals[f1]
-
-        e_vec_p = p_pos[shared_edges[:, 1]] - p_pos[shared_edges[:, 0]]
-        e_dir_p = F.normalize(e_vec_p, dim=1)
-
-        sin_p = (torch.cross(n1_p, n2_p, dim=1) * e_dir_p).sum(dim=1)
-        cos_p = (n1_p * n2_p).sum(dim=1)
-        theta_pred = torch.atan2(sin_p, cos_p)
-
-        # ── Ground truth dihedral angles ──────────────────────────────────
-        gt_normals = compute_face_normals(g_pos, faces)
-        n1_g, n2_g = gt_normals[f0], gt_normals[f1]
-
-        e_vec_g = g_pos[shared_edges[:, 1]] - g_pos[shared_edges[:, 0]]
-        e_dir_g = F.normalize(e_vec_g, dim=1)
-
-        sin_g = (torch.cross(n1_g, n2_g, dim=1) * e_dir_g).sum(dim=1)
-        cos_g = (n1_g * n2_g).sum(dim=1)
-        theta_gt = torch.atan2(sin_g, cos_g)
-
-        total_loss += F.mse_loss(theta_pred, theta_gt)
-
-    return total_loss / B
-
-
 # ── Loss: Collision Penalty ───────────────────────────────────────────────────
 
 def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002):
-    distances = torch.cdist(pred_pos, body_pos)
-    min_dist, nearest_idx = torch.min(distances, dim=1)
+    """
+    Memory-free collision penalty using PyKeOps.
+    Operates in O(N) VRAM instead of O(N*M).
+    """
+    # 1. Create LazyTensors with virtual axes
+    # pred_pos becomes an (N, 1, 3) virtual tensor (Axis i)
+    x_i = LazyTensor(pred_pos.view(-1, 1, 3))
+    
+    # body_pos becomes a (1, M, 3) virtual tensor (Axis j)
+    y_j = LazyTensor(body_pos.view(1, -1, 3))
+    
+    # 2. Symbolic distance calculation
+    # This does NOT compute the matrix yet. It just defines the math.
+    D_ij = ((x_i - y_j) ** 2).sum(-1) 
+    
+    # 3. Kernel Execution: Find the minimum and its index
+    # KeOps compiles and runs the C++ kernel here.
+    min_sq_dist, nearest_idx = D_ij.min_argmin(dim=1)
+    
+    # KeOps returns shapes (N, 1). Flatten them to match standard PyTorch.
+    min_sq_dist = min_sq_dist.view(-1)
+    nearest_idx = nearest_idx.view(-1).long() # Indices must be integers
+    
+    # Convert squared distance back to actual distance
+    min_dist = torch.sqrt(min_sq_dist)
+    
+    # 4. Standard PyTorch logic for penetration depth
     nearest_normals = body_normals[nearest_idx]
     direction_vectors = pred_pos - body_pos[nearest_idx]
     
@@ -464,9 +341,9 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
     if not inside_mask.any():
         return torch.tensor(0.0, device=pred_pos.device)
     
-    # Penalize based on how deep it is PLUS the safety threshold
-    # Now, deeper penetration = higher loss.
+    # Penalize deeper penetrations more heavily
     collision_error = min_dist[inside_mask] + threshold
+    
     return collision_error.mean()
 
 
@@ -474,14 +351,14 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
 
 def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
                fabric_logits, fabric_labels,
-               batch_idx=None, faces=None, face_adj=None, shared_edges=None,
+               batch_idx=None, faces=None,
                body_ids=None, get_body_data=None,
-               use_normal_consistency=False, use_bending_energy=False, use_laplacian=False):
+               use_normal_consistency=False, use_laplacian=False):
     """
     Calculates the raw mathematical losses. 
     Task balancing is handled externally by AutomaticLossWeighter.
 
-    Returns: d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
+    Returns: d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
     """
 
     # 1. Drape (Position MSE)
@@ -506,22 +383,36 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
             batch_col_loss += compute_collision_penalty(pred_pos[mask], b_pos, b_norm)
         col_loss = batch_col_loss / B
 
-    # 4. Normal Consistency (toggle via flag)
-    n_loss = torch.tensor(0.0, device=d_loss.device)
-    if use_normal_consistency and faces is not None and face_adj is not None and batch_idx is not None:
-        n_loss = compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx)
+    # Initialize PyTorch3D Meshes. 
+    # By passing lists of length 1, PyTorch3D treats the PyG batch as one giant mesh.
+    garment_meshes = None
+    if faces is not None and batch_idx is not None:
+        B = batch_idx.max().item() + 1
+        N = pred_pos.size(0) // B  # Number of vertices per garment (e.g., 14117)
 
-    # 5. Bending Energy (toggle via flag)
-    b_loss = torch.tensor(0.0, device=d_loss.device)
-    if use_bending_energy and faces is not None and face_adj is not None and shared_edges is not None and batch_idx is not None:
-        b_loss = compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx)
+        # Reshape from flat (B*N, 3) to batched (B, N, 3)
+        pred_pos_batched = pred_pos.view(B, N, 3)
+        
+        # Expand template faces from (F, 3) to (B, F, 3)
+        faces_batched = faces.unsqueeze(0).expand(B, -1, -1)
+
+        garment_meshes = Meshes(verts=pred_pos_batched, faces=faces_batched)
+
+    # 4 & 5. Normal Consistency & Bending Energy
+    # PyTorch3D's mesh_normal_consistency handles both curvature and dihedral angles 
+    # in a single highly optimized C++ kernel.
+    n_loss = torch.tensor(0.0, device=d_loss.device)    
+    if use_normal_consistency and garment_meshes is not None:
+        # This replaces both the previous normal and bending functions
+        n_loss = mesh_normal_consistency(garment_meshes)
 
     # 6. Laplacian Smoothness (toggle via flag)
     lap_loss = torch.tensor(0.0, device=d_loss.device)
-    if use_laplacian:
-        lap_loss = compute_laplacian_loss(predicted_delta, target_delta, edge_index)
-
+    if use_laplacian and garment_meshes is not None:
+        # Replaces manual node-degree gathering with a sparse matrix multiplication
+        lap_loss = mesh_laplacian_smoothing(garment_meshes, method="uniform")
+    
     # 7. Aux Classification
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
-    return d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
+    return d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
