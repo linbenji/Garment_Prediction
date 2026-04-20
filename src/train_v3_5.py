@@ -79,9 +79,9 @@ CONFIG = {
     # + normal_consistency if enabled
     # + laplacian if enabled
     'prior_drape':    1.0,  # Global position
-    'prior_strain':   0.5,  # Increased to enforce asymmetric buckling
-    'prior_normal':   3.0,  # High priority for wrinkles
-    'prior_laplacian': 0.3, # Smoothness/noise suppression
+    'prior_strain':   1.5,  # Increased to enforce asymmetric buckling
+    'prior_normal':   8.0,  # High priority for wrinkles
+    'prior_laplacian': 1.0, # Smoothness/noise suppression
     'prior_collision': 2.0, # Force fabric outside skin
     'prior_cls':      0.1,
 
@@ -89,7 +89,7 @@ CONFIG = {
     # are the *final* effective weights, not just starting values. Use for
     # diagnostic runs where you want a sustained intervention (e.g. 10x
     # prior_normal) instead of a transient kick the weighter will adapt away.
-    'freeze_weighter': False,
+    'freeze_weighter': True,
 
     # Logging
     'log_every':       10,
