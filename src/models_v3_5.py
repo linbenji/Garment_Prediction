@@ -181,7 +181,7 @@ class UVRefinementNet(nn.Module):
         # x: (N, latent_dim), uvs: (N, 2), batch_idx: (N,)
         # This is a simplified projection for v3.5
         B = batch_idx.max().item() + 1
-        grid = torch.zeros((B, x.size(1), self.res, self.res), device=x.device)
+        grid = torch.zeros((B, x.size(1), self.res, self.res), device=x.device, dtype=x.dtype)
         
         # Map [0,1] UVs to grid indices
         coords = (uvs * (self.res - 1)).long()
@@ -199,7 +199,8 @@ class UVRefinementNet(nn.Module):
             x_idx_expand = x_idx.view(1, num_nodes).expand(C, num_nodes)
             
             # Safely accumulate features without overwriting overlapping UVs
-            grid[i].index_put_((c_idx, y_idx_expand, x_idx_expand), x[mask].t(), accumulate=True)
+            grid[i].index_put_((c_idx.flatten(), y_idx_expand.flatten(), x_idx_expand.flatten()),
+                               x[mask].t().flatten(), accumulate=True)
             
         refinement_map = self.net(grid) # (B, 3, res, res)
         
@@ -339,7 +340,7 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
     inside_mask = (torch.sum(direction_vectors * nearest_normals, dim=1) < 0)
     
     if not inside_mask.any():
-        return torch.tensor(0.0, device=pred_pos.device)
+        return (pred_pos.sum() * 0.0)
     
     # Penalize deeper penetrations more heavily
     collision_error = min_dist[inside_mask] + threshold

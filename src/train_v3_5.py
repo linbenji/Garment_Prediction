@@ -28,8 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
 from models_v3_5 import (
-    NonbelieverDrapeModel, AutomaticLossWeighter,
-    drape_loss, build_face_adjacency, compute_laplacian_loss, compute_collision_penalty
+    NonbelieverDrapeModel, AutomaticLossWeighter, drape_loss
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -246,7 +245,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
 @torch.no_grad()
 def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
-              faces_t, get_body_data, split='val'):
+              faces_t, get_body_data, amp_dtype, split='val'):
     torch.cuda.empty_cache()
     model.eval()
 
@@ -265,7 +264,8 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
 
     for batch in loader:
         batch = batch.to(device)
-        predicted_delta, fabric_logits = model(batch)
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
+            predicted_delta, fabric_logits = model(batch)
 
         # LOSS CALCULATIONS
         d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss = drape_loss(
@@ -536,7 +536,7 @@ def main():
     # ── Optimiser & Scheduler ─────────────────────────────────────────────────
     # Only include the loss weighter's params in the optimizer if they're trainable.
     optim_groups = [
-        {'params': filter(lambda p: p.requires_grad, model.parameters())},
+        {'params': list(filter(lambda p: p.requires_grad, model.parameters()))},
     ]
     if not cfg.get('freeze_weighter', False):
         optim_groups.append({'params': loss_weighter.parameters(), 'weight_decay': 0.0})
@@ -577,7 +577,7 @@ def main():
                                     faces_t, get_body_data)
 
         val_metrics = val_epoch(model, val_loader, device, cfg, epoch, logger, loss_weighter,
-                                faces_t, get_body_data, split='val')
+                                faces_t, get_body_data, amp_dtype, split='val')
 
         # Step scheduler on val_mve, NOT val_loss (see note above).
         scheduler.step(val_metrics['mve'])
