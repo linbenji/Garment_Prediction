@@ -2,37 +2,6 @@
 models_v4_5.py
 
 UnfrozenPatchDrapeModel: DINOv2 (LoRA rank=8) + FiLM + Patch Token Cross-Attention
-
-CHANGES FROM models_v4.py (your current working file, LoRA + CLS cross-attn):
-
-  1. StyleViT_DINO_LoRA_Patch replaces StyleViT_DINO_LoRA
-       - Uses forward_features() instead of forward() to get 196 patch tokens
-       - projection_head split into patch_proj (196 tokens) + cls_proj (CLS)
-       - Returns (patch_emb, style_emb) — TWO tensors instead of one
-       - torch.no_grad() still absent — LoRA matrices still need gradients
-
-  2. CrossAttentionLayer.forward() signature and internals change
-       - Argument: patch_tokens (B, 196, latent_dim) instead of style_emb (B, latent_dim)
-       - sigmoid → softmax: attending over a sequence needs competitive attention
-       - dot product → bmm: K and V are now 3D, need batched matrix multiply
-
-  3. UnfrozenPatchDrapeModel.forward() — three lines change
-       - Unpack two tensors from self.vit
-       - Mean-pool patch tokens for FiLM global conditioning
-       - Pass patch_emb (not style_emb) into cross-attention
-
-  4. lora_rank default = 8, lora_alpha default = 16 (keeps scale = alpha/rank = 2.0)
-       - rank=8 justified by patch tokens: each of 196 tokens needs richer
-         per-token fabric adaptation vs rank=4 which was enough for a single CLS
-
-  5. NUM_PATCHES = 196 constant added
-
-Everything else unchanged from models_v4.py:
-  - LoRALinear class identical
-  - FiLMMeshBlock identical
-  - AutomaticLossWeighter identical
-  - All loss functions identical
-  - build_face_adjacency identical
 """
 
 import torch
@@ -53,7 +22,7 @@ SIZE_DIM    = 2
 
 EDGE_IN_DIM  = 4
 LATENT_DIM   = 128
-NUM_PATCHES  = 196  # DINOv2-Small 14×14 patch grid over 224×224 input
+NUM_PATCHES  = 196
 
 NUM_FABRIC_FAMILIES = 6
 
@@ -78,20 +47,6 @@ def build_mlp(in_dim, out_dim, hidden_dim=256):
 # ── LoRA Linear ───────────────────────────────────────────────────────────────
 
 class LoRALinear(nn.Module):
-    """
-    Unchanged from models_v4.py.
-
-    output = W_frozen(x) + lora_B(lora_A(x)) * scale
-
-    rank=8 in v4.5 vs rank=4 in v4:
-        Full matrix : 384 × 384 = 147,456 params
-        LoRA rank=4 : (384×4)  + (4×384)  =  3,072 params
-        LoRA rank=8 : (384×8)  + (8×384)  =  6,144 params  ← used here
-    Still 24x fewer than full fine-tuning.
-
-    lora_B = zeros at init → LoRA contribution is zero at start,
-    model behaves identically to frozen DINOv2 until training begins.
-    """
     def __init__(self, frozen_linear, rank=4, alpha=8):
         super().__init__()
         in_dim  = frozen_linear.in_features
@@ -116,38 +71,16 @@ class LoRALinear(nn.Module):
 # ── Vision Backbone: DINOv2 LoRA + Patch Tokens ───────────────────────────────
 
 class StyleViT_DINO_LoRA_Patch(nn.Module):
-    """
-    DINOv2-Small with LoRA on last `lora_blocks` blocks, returning 196 patch tokens.
-
-    CHANGES FROM StyleViT_DINO_LoRA (models_v4.py):
-      - forward() uses backbone.forward_features() instead of backbone()
-      - projection_head split into:
-          patch_proj : Linear(384, latent_dim) + LayerNorm  — projects each patch token
-          cls_proj   : original deeper head — projects CLS token for classifier + FiLM
-      - Returns TWO tensors: (patch_emb, style_emb)
-          patch_emb  : (B, 196, latent_dim) — for patch cross-attention in GNN
-          style_emb  : (B, embed_dim=128)   — for fabric_classifier and FiLM mean pool
-
-    LoRA setup is identical to models_v4.py — only the forward pass changes.
-    torch.no_grad() is still absent — LoRA matrices still need gradients.
-
-    forward_features() dict keys:
-        'x_norm_patchtokens' : (B, 196, 384) — patch tokens, no CLS
-        'x_norm_clstoken'    : (B, 384)      — CLS token only
-        'x_norm'             : (B, 197, 384) — all tokens (CLS at index 0)
-    """
     def __init__(self, embed_dim=STYLE_DIM, latent_dim=LATENT_DIM,
                  lora_rank=8, lora_alpha=16, lora_blocks=4):
         super().__init__()
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
 
-        # Freeze everything first
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # Apply LoRA to last lora_blocks transformer blocks
-        n_blocks   = len(self.backbone.blocks)  # 12
-        lora_start = n_blocks - lora_blocks      # 8 for last 4 blocks
+        n_blocks   = len(self.backbone.blocks)
+        lora_start = n_blocks - lora_blocks
 
         for block_idx in range(lora_start, n_blocks):
             block = self.backbone.blocks[block_idx]
@@ -155,13 +88,10 @@ class StyleViT_DINO_LoRA_Patch(nn.Module):
             attn.qkv  = LoRALinear(attn.qkv,  rank=lora_rank, alpha=lora_alpha)
             attn.proj = LoRALinear(attn.proj, rank=lora_rank, alpha=lora_alpha)
 
-        # CHANGED: split into two projectors
-        # patch_proj: lightweight — runs on all 196 tokens independently
         self.patch_proj = nn.Sequential(
             nn.Linear(384, latent_dim),
             nn.LayerNorm(latent_dim),
         )
-        # cls_proj: same as original projection_head — for classifier and FiLM
         self.cls_proj = nn.Sequential(
             nn.Linear(384, 256),
             nn.GELU(),
@@ -178,22 +108,19 @@ class StyleViT_DINO_LoRA_Patch(nn.Module):
         print(f"  Patch tokens: {NUM_PATCHES} × {latent_dim}-dim per image")
 
     def forward(self, images):
-        # No torch.no_grad() — LoRA matrices need gradients
-        # CHANGED: forward_features() instead of forward()
         out = self.backbone.forward_features(images)
-        patch_tokens = out['x_norm_patchtokens']   # (B, 196, 384)
-        cls_token    = out['x_norm_clstoken']      # (B, 384)
+        patch_tokens = out['x_norm_patchtokens']
+        cls_token    = out['x_norm_clstoken']
 
-        patch_emb = self.patch_proj(patch_tokens)  # (B, 196, latent_dim)
-        style_emb = self.cls_proj(cls_token)       # (B, 128)
+        patch_emb = self.patch_proj(patch_tokens)
+        style_emb = self.cls_proj(cls_token)
 
-        return patch_emb, style_emb  # CHANGED: returns two tensors
+        return patch_emb, style_emb
 
 
 # ── FiLM Mesh Block ───────────────────────────────────────────────────────────
 
 class FiLMMeshBlock(MessagePassing):
-    """Unchanged from models_v4.py."""
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__(aggr='sum')
         self.edge_mlp = build_mlp(latent_dim * 3, latent_dim)
@@ -218,36 +145,6 @@ class FiLMMeshBlock(MessagePassing):
 # ── Cross-Attention Layer (Patch Token version) ───────────────────────────────
 
 class CrossAttentionLayer(nn.Module):
-    """
-    Per-vertex cross-attention over 196 spatial patch tokens.
-
-    CHANGES FROM models_v4.py CrossAttentionLayer:
-
-    Argument change:
-        was:  forward(self, x, style_emb, batch)    style_emb: (B, latent_dim)
-        now:  forward(self, x, patch_tokens, batch) patch_tokens: (B, 196, latent_dim)
-
-    sigmoid → softmax:
-        models_v4.py used sigmoid because there was one key/value vector per graph.
-        Sigmoid over one element is a simple gate in [0,1] — correct for single vector.
-        With 196 tokens, softmax is correct — each node distributes its attention
-        budget competitively across all 196 spatial locations. A node can't attend
-        fully to every token simultaneously; it must choose which regions matter.
-
-    dot product → bmm:
-        K and V are now (total_nodes, 196, latent_dim) — 3D tensors.
-        bmm (batched matrix multiply) handles this cleanly:
-            Q.unsqueeze(1) : (total_nodes, 1, latent_dim)
-            K.transpose    : (total_nodes, latent_dim, 196)
-            bmm result     : (total_nodes, 1, 196) — one score per patch per node
-
-    Why this is better than CLS cross-attention:
-        CLS compresses the entire image into one vector. Every mesh node attends
-        to the exact same information regardless of where on the shirt it sits.
-        Patch tokens preserve spatial structure — hem vertices can learn to weight
-        lower-image tokens (where drape folds appear), collar vertices can weight
-        upper-image tokens. The attention is genuinely spatial.
-    """
     def __init__(self, latent_dim=LATENT_DIM):
         super().__init__()
         self.norm   = nn.LayerNorm(latent_dim)
@@ -257,29 +154,21 @@ class CrossAttentionLayer(nn.Module):
         self.scale  = latent_dim ** -0.5
 
     def forward(self, x, patch_tokens, batch):
-        """
-        x           : (total_nodes, latent_dim)
-        patch_tokens: (B, 196, latent_dim)
-        batch       : (total_nodes,) — node-to-graph index
-        """
         x_norm = self.norm(x)
-        Q = self.q_proj(x_norm)                          # (total_nodes, latent_dim)
-        K = self.k_proj(patch_tokens)[batch]             # (total_nodes, 196, latent_dim)
-        V = self.v_proj(patch_tokens)[batch]             # (total_nodes, 196, latent_dim)
+        Q = self.q_proj(x_norm)
+        K = self.k_proj(patch_tokens)[batch]
+        V = self.v_proj(patch_tokens)[batch]
 
-        # Scaled dot-product over 196 tokens
         attn = torch.bmm(Q.unsqueeze(1), K.transpose(1, 2)) * self.scale
-        # attn: (total_nodes, 1, 196)
-        attn = torch.softmax(attn, dim=-1)               # competitive over 196 tokens
+        attn = torch.softmax(attn, dim=-1)
 
-        out = torch.bmm(attn, V).squeeze(1)              # (total_nodes, latent_dim)
+        out = torch.bmm(attn, V).squeeze(1)
         return x + out
 
 
 # ── Automatic Loss Weighter ───────────────────────────────────────────────────
 
 class AutomaticLossWeighter(nn.Module):
-    """Unchanged from models_v4.py."""
     def __init__(self, num_tasks, priors=None):
         super().__init__()
         self.log_vars = nn.Parameter(torch.zeros(num_tasks))
@@ -301,29 +190,11 @@ class AutomaticLossWeighter(nn.Module):
 # ── Master Model ──────────────────────────────────────────────────────────────
 
 class UnfrozenPatchDrapeModel(nn.Module):
-    """
-    v4.5 — LoRA DINOv2 (rank=8) + FiLM + Patch Token CrossAttention
-
-    CHANGES FROM models_v4.py UnfrozenPatchDrapeModel:
-
-    __init__:
-      - self.vit = StyleViT_DINO_LoRA_Patch(...) instead of StyleViT_DINO_LoRA
-      - lora_rank default changed to 8, lora_alpha default changed to 16
-
-    forward() — three lines change:
-      1. Unpack two tensors:  patch_emb, style_emb = self.vit(data.image)
-      2. Mean-pool for FiLM:  patch_mean = patch_emb.mean(dim=1)
-                              global_cond = torch.cat([patch_mean, ...])
-      3. Cross-attn call:     cross_attn(x, patch_emb, b)  not  (x, style_emb, b)
-
-    fabric_classifier still uses style_emb (CLS-based) — unchanged.
-    """
     def __init__(self, gnn_layers, embed_dim=STYLE_DIM, latent_dim=LATENT_DIM,
                  cross_attn_layers=None,
-                 lora_rank=8, lora_alpha=16, lora_blocks=4):  # rank=8, alpha=16
+                 lora_rank=8, lora_alpha=16, lora_blocks=4):
         super().__init__()
 
-        # CHANGED: patch token backbone with rank=8
         self.vit = StyleViT_DINO_LoRA_Patch(
             embed_dim=embed_dim,
             latent_dim=latent_dim,
@@ -360,20 +231,15 @@ class UnfrozenPatchDrapeModel(nn.Module):
         print(f"  [v4.5] LoRA rank={lora_rank} | Patch CrossAttn after layers: {human_readable}")
 
     def forward(self, data):
-        # CHANGED line 1: unpack two tensors
         patch_emb, style_emb = self.vit(data.image)
-        # patch_emb : (B, 196, latent_dim) — spatial patch tokens for cross-attn
-        # style_emb : (B, 128)             — CLS for classifier + FiLM
-
-        # CHANGED line 2: mean-pool patches for FiLM (same shape as before)
-        patch_mean = patch_emb.mean(dim=1)  # (B, latent_dim)
+        patch_mean = patch_emb.mean(dim=1)
 
         global_cond = torch.cat([
-            patch_mean,                              # was style_emb
+            patch_mean,
             data.tgt_smpl.view(-1, SMPL_DIM),
             data.tgt_physics.view(-1, PHYSICS_DIM),
             data.tgt_size.view(-1, SIZE_DIM),
-        ], dim=-1)  # (B, 150) — same shape as before
+        ], dim=-1)
 
         x = torch.cat([data.pos, data.uvs, data.normals], dim=-1)
         x = self.node_encoder(x)
@@ -387,11 +253,9 @@ class UnfrozenPatchDrapeModel(nn.Module):
             x, edge_attr      = layer(x, data.edge_index, edge_attr, gamma, beta)
 
             if i in self.cross_attn_layers:
-                # CHANGED line 3: pass patch_emb instead of style_emb
                 x = self.cross_attn_modules[str(i)](x, patch_emb, b)
 
         predicted_delta = self.decoder(x)
-        # classifier unchanged — still uses CLS-based style_emb
         fabric_logits   = self.fabric_classifier(style_emb)
         return predicted_delta, fabric_logits
 
@@ -399,7 +263,6 @@ class UnfrozenPatchDrapeModel(nn.Module):
 # ── Face Adjacency ────────────────────────────────────────────────────────────
 
 def build_face_adjacency(faces):
-    """Unchanged from models_v4.py."""
     edge_to_face = {}
     adjacency    = []
     shared       = []
@@ -419,7 +282,7 @@ def build_face_adjacency(faces):
             torch.tensor(shared,    dtype=torch.long))
 
 
-# ── Loss Functions (all unchanged from models_v4.py) ─────────────────────────
+# ── Loss Functions ────────────────────────────────────────────────────────────
 
 def compute_face_normals(verts, faces):
     v0 = verts[faces[:, 0]]
@@ -433,6 +296,32 @@ def compute_edge_strain_loss(pred_pos, gt_pos, edge_index):
     pred_len = torch.norm(pred_pos[row] - pred_pos[col], dim=1)
     gt_len   = torch.norm(gt_pos[row]   - gt_pos[col],   dim=1)
     return F.mse_loss(pred_len, gt_len)
+
+
+def compute_laplacian_loss(pred_delta, gt_delta, edge_index):
+    """
+    Penalises differences in the discrete Laplacian of the displacement field.
+    Operates directly in mm-space — no gradient vanishing near flat regions.
+    """
+    row, col = edge_index
+    N = pred_delta.size(0)
+    D = pred_delta.size(1)
+    device = pred_delta.device
+
+    ones = torch.ones(row.size(0), device=device)
+    deg  = torch.zeros(N, device=device).scatter_add_(0, row, ones).clamp(min=1)
+
+    index    = row.unsqueeze(1).expand(-1, D)
+    pred_sum = torch.zeros_like(pred_delta).scatter_add_(0, index, pred_delta[col])
+    gt_sum   = torch.zeros_like(gt_delta  ).scatter_add_(0, index, gt_delta[col])
+
+    pred_neigh_mean = pred_sum / deg.unsqueeze(1)
+    gt_neigh_mean   = gt_sum   / deg.unsqueeze(1)
+
+    pred_lap = pred_delta - pred_neigh_mean
+    gt_lap   = gt_delta   - gt_neigh_mean
+
+    return F.mse_loss(pred_lap, gt_lap)
 
 
 def compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx):
@@ -495,9 +384,12 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
                batch_idx=None, faces=None, face_adj=None, shared_edges=None,
                body_pos=None, body_normals=None,
                use_normal_consistency=False, use_bending_energy=False,
+               use_laplacian=False,
                cls_weight=0.1, strain_weight=0.1, collision_weight=1.0,
-               normal_weight=0.1, bending_weight=0.1):
-
+               normal_weight=0.1, bending_weight=0.1, laplacian_weight=0.1):
+    """
+    Returns: total, d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
+    """
     sq_err   = ((predicted_delta - target_delta) ** 2).sum(dim=-1)
     d_loss   = (sq_err * loss_weight).mean()
     pred_pos = template_pos + predicted_delta
@@ -521,6 +413,10 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
         b_loss = compute_bending_energy_loss(
             pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx)
 
+    lap_loss = torch.tensor(0.0, device=d_loss.device)
+    if use_laplacian:
+        lap_loss = compute_laplacian_loss(predicted_delta, target_delta, edge_index)
+
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
     total = (d_loss
@@ -528,6 +424,7 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
              + collision_weight * col_loss
              + normal_weight    * n_loss
              + bending_weight   * b_loss
+             + laplacian_weight * lap_loss
              + cls_weight       * c_loss)
 
-    return total, d_loss, e_loss, col_loss, n_loss, b_loss, c_loss
+    return total, d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
