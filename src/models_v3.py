@@ -347,10 +347,16 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
     min_dist, nearest_idx = torch.min(distances, dim=1)
     nearest_normals = body_normals[nearest_idx]
     direction_vectors = pred_pos - body_pos[nearest_idx]
+    
+    # Dot product < 0 means the garment is inside the skin
     inside_mask = (torch.sum(direction_vectors * nearest_normals, dim=1) < 0)
-    collision_error = torch.relu(threshold - min_dist[inside_mask])
-    if collision_error.numel() == 0:
+    
+    if not inside_mask.any():
         return torch.tensor(0.0, device=pred_pos.device)
+    
+    # Penalize based on how deep it is PLUS the safety threshold
+    # Now, deeper penetration = higher loss.
+    collision_error = min_dist[inside_mask] + threshold
     return collision_error.mean()
 
 
