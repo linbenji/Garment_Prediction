@@ -76,7 +76,7 @@ CONFIG = {
 
     # Surface quality losses
     'use_normal_consistency': True,
-    'use_bending_energy':     False,
+    'use_bending_energy':     True,
     'use_laplacian':          False,
 
     # Loss priors
@@ -84,16 +84,16 @@ CONFIG = {
     'prior_strain':    0.2,
     'prior_cls':       0.1,
     'prior_normal':    0.5,
-    'prior_bending':   0.3,
+    'prior_bending':   0.5,
     'prior_laplacian': 0.1,
 
     # Freeze loss weighter
-    'freeze_weighter': False,
+    'freeze_weighter': True,
 
     # Logging
     'log_every':       10,
     'use_wandb':       True,
-    'experiment_name': 'v4_5_lora_patch',
+    'experiment_name': 'model_v4_5_lora_patch',
 }
 
 
