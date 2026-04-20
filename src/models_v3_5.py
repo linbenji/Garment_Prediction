@@ -1,61 +1,54 @@
 """
-models_v3_5.py (Hierarchical Multi-Scale Architecture) — PATCHED
+models_v3_5.py (Hierarchical Multi-Scale Architecture)
 
-NonbelieverDrapeModel:
+NonbelieverDrapeModel: 
 DINOv2 + FiLM-GNN + U-Net Skip Fusion + 2D UV-Refinement + Physics Septet Loss
 
-Patches applied relative to the original v3.5:
-  - UVRefinementNet:
-      * vectorized scatter-add (no Python batch loop)
-      * UVs clamped to [0, 1] before indexing (prevents OOB on seam verts)
-      * final Conv2d zero-initialized so the refinement head starts as
-        identity; base GNN drives early training before the refiner kicks in
-      * default `grid_res=128` as an explicit int (was `grid_res=LATENT_DIM`)
-  - compute_collision_penalty:
-      * version-robust unpacking of `LazyTensor.min_argmin` (handles both
-        tuple and (N, 2) tensor returns across pyKeOps versions)
-      * float32 promotion so PyKeOps works correctly under bfloat16 autocast
-      * comment clarified: penalty is linear in penetration depth with a
-        small threshold floor for near-surface interior points
-  - drape_loss:
-      * pytorch3d removed entirely — mesh_normal_consistency and
-        mesh_laplacian_smoothing replaced with pure PyTorch implementations
-      * `body_ids.tolist()` once per call instead of `.item()` per sample
-      * single `B = batch_idx.max().item()` sync, reused for both the
-        collision loop and the mesh loss construction
+This model moves beyond global shape prediction to capture high-frequency 
+surface details (folds, wrinkles) by decoupling global drape from local 
+geometric refinement.
 
-Architecture notes (unchanged):
+Key Architectural Features:
 -------------------------------------------------------------------------------
 1. Vision Backbone (Style & Texture):
-   - StyleViT_DINO: Frozen DINOv2-Small (vits14) acts as a high-level feature
-     extractor. It provides a 128-dim global 'style' embedding that encodes
+   - StyleViT_DINO: Frozen DINOv2-Small (vits14) acts as a high-level feature 
+     extractor. It provides a 128-dim global 'style' embedding that encodes 
      material properties (stiffness, weight) and visual context.
 
 2. Conditioning Engine (FiLM):
-   - Feature-wise Linear Modulation: Style, SMPL betas, Physics params, and
+   - Feature-wise Linear Modulation: Style, SMPL betas, Physics params, and 
      Size encodings are fused into a 150-dim global context vector.
-   - Per-layer FiLM Generators: Every GNN block receives a unique scale (gamma)
-     and shift (beta) based on this context, allowing the global state to
+   - Per-layer FiLM Generators: Every GNN block receives a unique scale (gamma) 
+     and shift (beta) based on this context, allowing the global state to 
      dynamically 'steer' the local vertex updates.
 
 3. Core Processor (Hierarchical GNN):
-   - U-Net Style Skip Connections: Captures features at multiple scales.
-     Features from early (global drape), middle, and late (local detail)
+   - U-Net Style Skip Connections: Captures features at multiple scales. 
+     Features from early (global drape), middle, and late (local detail) 
      layers are concatenated and fused via a Hierarchical Fuser MLP.
-   - Deep Message Passing: 12 FiLMMeshBlocks enable long-range signal
+   - Deep Message Passing: 12 FiLMMeshBlocks enable long-range signal 
      propagation across the 14,117-node mesh.
 
 4. 2D UV-Space Refinement Head (CNN Detailer):
-   - Spatial Detail Projection: GNN node features are mapped onto a 128x128
+   - Spatial Detail Projection: GNN node features are mapped onto a 128x128 
      2D grid based on vertex UV coordinates.
-   - 2D ResNet Refiner: Uses 2D convolutions to 'paint' high-frequency
+   - 2D ResNet Refiner: Uses 2D convolutions to 'paint' high-frequency 
      displacement maps, capturing sharp wrinkles that GNNs naturally smooth out.
-   - Grid Sampling: Refined displacements are sampled back to vertices and
+   - Grid Sampling: Refined displacements are sampled back to vertices and 
      added to the base GNN prediction.
 
 5. Physics Septet Loss (Training Objectives):
-   - Position (MVE), Asymmetric Strain, Collision, Normal Consistency,
-     Laplacian Smoothness, Aux Classification.
+   - Position (MVE): Standard MSE for global coordinate accuracy.
+   - Asymmetric Strain: Penalizes extension (stretching) 10x more than 
+     compression, forcing the fabric to buckle into realistic folds.
+   - Collision Penalty: Corrected logic that uses body surface normals to 
+     force fabric outside the skin, creating physical pressure.
+   - Normal Consistency: High-priority cosine similarity to ensure wrinkles 
+     face the correct physical direction.
+   - Bending Energy: Dihedral angle penalty to maintain soft fabric sweeps.
+   - Laplacian Smoothness: MM-space penalty to eliminate 'orange-peel' mesh 
+     noise and jittery vertices.
+   - Aux Classification: Forces the backbone to distinguish material families.
 -------------------------------------------------------------------------------
 """
 
@@ -306,6 +299,40 @@ class NonbelieverDrapeModel(nn.Module):
         fabric_logits = self.fabric_classifier(style_emb)
 
         return base_delta + fine_delta, fabric_logits
+    
+
+# ── Face Adjacency (precompute once at training startup) ─────────────────────
+
+def build_face_adjacency(faces):
+    edge_to_face = {}
+    adjacency = []
+    shared = []
+
+    for fi in range(len(faces)):
+        for j in range(3):
+            v0 = int(faces[fi][j])
+            v1 = int(faces[fi][(j + 1) % 3])
+            edge_key = (min(v0, v1), max(v0, v1))
+
+            if edge_key in edge_to_face:
+                adjacency.append([edge_to_face[edge_key], fi])
+                shared.append([edge_key[0], edge_key[1]])
+            else:
+                edge_to_face[edge_key] = fi
+
+    face_adj     = torch.tensor(adjacency, dtype=torch.long)
+    shared_edges = torch.tensor(shared, dtype=torch.long)
+    return face_adj, shared_edges
+
+
+# ── Loss Helper: Face Normals ─────────────────────────────────────────────────
+
+def compute_face_normals(verts, faces):
+    v0 = verts[faces[:, 0]]
+    v1 = verts[faces[:, 1]]
+    v2 = verts[faces[:, 2]]
+    normals = torch.cross(v1 - v0, v2 - v0, dim=1)
+    return F.normalize(normals, dim=1)
 
 
 # ── Loss: Edge Strain (Asymmetric) ───────────────────────────────────────────
@@ -322,81 +349,101 @@ def compute_edge_strain_loss(pred_pos, gt_pos, edge_index, w_ext=5.0, w_comp=0.5
     return strain_sq.mean()
 
 
-# ── Loss: Normal Consistency (pure PyTorch) ───────────────────────────────────
+# ── Loss: Normal Consistency (pure PyTorch, Optimized) ────────────────────────
 
-def mesh_normal_consistency(pred_pos, faces):
+def compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx):
     """
-    Vectorized normal consistency loss — pure PyTorch, no pytorch3d required.
-
-    For every pair of faces sharing an edge, penalizes the cosine distance
-    between their normals. Encourages smooth, physically-plausible surface
-    curvature and correct wrinkle orientation.
-
-    Args:
-        pred_pos : (N, 3) vertex positions (flat batch, faces already offset)
-        faces    : (F, 3) long — triangle indices into pred_pos
+    Penalizes the cosine distance between adjacent face normals.
+    Uses precomputed face adjacency for O(1) topological lookups.
     """
-    v0 = pred_pos[faces[:, 0]]
-    v1 = pred_pos[faces[:, 1]]
-    v2 = pred_pos[faces[:, 2]]
-    face_normals = F.normalize(torch.cross(v1 - v0, v2 - v0, dim=-1), dim=-1)  # (F, 3)
+    B = batch_idx.max().item() + 1
+    total_loss = 0.0
+    f0, f1 = face_adj[:, 0], face_adj[:, 1]
 
-    F_count = faces.size(0)
-    # Each face contributes 3 half-edges; sort each so (a,b)==(b,a).
-    edges = torch.cat([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [0, 2]]], dim=0)  # (3F, 2)
-    face_for_edge = torch.arange(F_count, device=faces.device).repeat(3)             # (3F,)
-    edge_key = edges.sort(dim=1).values                                               # (3F, 2)
+    for i in range(B):
+        mask  = (batch_idx == i)
+        p_pos = pred_pos[mask]
+        g_pos = gt_pos[mask]
 
-    _, inverse, counts = torch.unique(edge_key, return_inverse=True, return_counts=True, dim=0)
+        pred_normals = compute_face_normals(p_pos, faces)
+        gt_normals   = compute_face_normals(g_pos, faces)
 
-    # Only manifold edges (shared by exactly 2 faces) contribute.
-    shared_mask = (counts == 2)[inverse]                    # (3F,) bool
-    shared_indices = torch.where(shared_mask)[0]            # indices into 3F
-    shared_inverse = inverse[shared_mask]
+        pred_dots = (pred_normals[f0] * pred_normals[f1]).sum(dim=1)
+        gt_dots   = (gt_normals[f0]   * gt_normals[f1]).sum(dim=1)
 
-    # Sort so paired half-edges are adjacent.
-    sort_order = shared_inverse.argsort(stable=True)
-    sorted_indices = shared_indices[sort_order]
+        total_loss += F.mse_loss(pred_dots, gt_dots)
 
-    face_a = face_for_edge[sorted_indices[0::2]]
-    face_b = face_for_edge[sorted_indices[1::2]]
-
-    cos_sim = (face_normals[face_a] * face_normals[face_b]).sum(dim=-1)
-    return (1.0 - cos_sim).mean()
+    return total_loss / B
 
 
-# ── Loss: Laplacian Smoothing (pure PyTorch) ──────────────────────────────────
+# ── Loss: Bending Energy ──────────────────────────────────────────────────────
 
-def mesh_laplacian_smoothing(pred_pos, faces):
+def compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx):
+    B = batch_idx.max().item() + 1
+    total_loss = 0.0
+    f0, f1 = face_adj[:, 0], face_adj[:, 1]
+
+    for i in range(B):
+        mask  = (batch_idx == i)
+        p_pos = pred_pos[mask]
+        g_pos = gt_pos[mask]
+
+        pred_normals = compute_face_normals(p_pos, faces)
+        n1_p, n2_p = pred_normals[f0], pred_normals[f1]
+
+        e_vec_p = p_pos[shared_edges[:, 1]] - p_pos[shared_edges[:, 0]]
+        e_dir_p = F.normalize(e_vec_p, dim=1)
+
+        sin_p = (torch.cross(n1_p, n2_p, dim=1) * e_dir_p).sum(dim=1)
+        cos_p = (n1_p * n2_p).sum(dim=1)
+        theta_pred = torch.atan2(sin_p, cos_p)
+
+        gt_normals = compute_face_normals(g_pos, faces)
+        n1_g, n2_g = gt_normals[f0], gt_normals[f1]
+
+        e_vec_g = g_pos[shared_edges[:, 1]] - g_pos[shared_edges[:, 0]]
+        e_dir_g = F.normalize(e_vec_g, dim=1)
+
+        sin_g = (torch.cross(n1_g, n2_g, dim=1) * e_dir_g).sum(dim=1)
+        cos_g = (n1_g * n2_g).sum(dim=1)
+        theta_gt = torch.atan2(sin_g, cos_g)
+
+        total_loss += F.mse_loss(theta_pred, theta_gt)
+
+    return total_loss / B
+
+
+# ── Loss: Laplacian Smoothing (pure PyTorch, Detail Preserving) ───────────────
+
+def compute_laplacian_loss(pred_delta, gt_delta, edge_index):
     """
-    Vectorized uniform Laplacian smoothing loss — pure PyTorch, no pytorch3d.
-
-    Penalizes each vertex for deviating from the mean of its neighbors,
-    suppressing high-frequency 'orange-peel' mesh noise and jittery verts.
-
-    Args:
-        pred_pos : (N, 3) vertex positions (flat batch, faces already offset)
-        faces    : (F, 3) long — triangle indices into pred_pos
+    Penalizes differences in the discrete Laplacian between predicted and GT.
+    Uses PyG's edge_index directly instead of rebuilding graph topology.
     """
-    N = pred_pos.size(0)
-    # Collect all directed edges from the face list.
-    edges = torch.cat([
-        faces[:, [0, 1]], faces[:, [1, 0]],
-        faces[:, [1, 2]], faces[:, [2, 1]],
-        faces[:, [0, 2]], faces[:, [2, 0]],
-    ], dim=0)
-    src, dst = edges[:, 0], edges[:, 1]
+    row, col = edge_index 
+    N = pred_delta.size(0)
+    D = pred_delta.size(1)
+    device = pred_delta.device
 
-    neighbor_sum = torch.zeros_like(pred_pos)
-    neighbor_sum.index_add_(0, src, pred_pos[dst])
+    # Degree of each vertex (number of neighbours)
+    ones = torch.ones(row.size(0), device=device)
+    deg = torch.zeros(N, device=device).scatter_add_(0, row, ones).clamp(min=1)
 
-    degree = torch.zeros(N, 1, device=pred_pos.device, dtype=pred_pos.dtype)
-    ones   = torch.ones(src.size(0), 1, device=pred_pos.device, dtype=pred_pos.dtype)
-    degree.index_add_(0, src, ones)
-    degree = degree.clamp_min(1.0)
+    # Sum of neighbour delta values for each vertex
+    index = row.unsqueeze(1).expand(-1, D)
+    pred_sum = torch.zeros_like(pred_delta).scatter_add_(0, index, pred_delta[col])
+    gt_sum   = torch.zeros_like(gt_delta  ).scatter_add_(0, index, gt_delta[col])
 
-    laplacian = pred_pos - neighbor_sum / degree
-    return (laplacian ** 2).sum(dim=-1).mean()
+    # Mean of neighbours
+    pred_neigh_mean = pred_sum / deg.unsqueeze(1)
+    gt_neigh_mean   = gt_sum   / deg.unsqueeze(1)
+
+    # Laplacian = self - mean(neighbours)
+    pred_lap = pred_delta - pred_neigh_mean
+    gt_lap   = gt_delta   - gt_neigh_mean
+
+    # Compare to GT to preserve structure
+    return F.mse_loss(pred_lap, gt_lap)
 
 
 # ── Loss: Collision Penalty ──────────────────────────────────────────────────
@@ -413,7 +460,7 @@ def _unpack_min_argmin(result):
     return result[..., 0:1], result[..., 1:2]
 
 
-def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002):
+def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.001):
     """
     Memory-free collision penalty using PyKeOps. O(N) VRAM.
 
@@ -457,27 +504,27 @@ def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002)
 
 def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
                fabric_logits, fabric_labels,
-               batch_idx=None, faces=None,
+               batch_idx=None, faces=None, face_adj=None, shared_edges=None,
                body_ids=None, get_body_data=None,
-               use_normal_consistency=False, use_laplacian=False):
+               use_normal_consistency=False, use_bending_energy=False, use_laplacian=False):
     """
-    Calculates the raw mathematical losses. Task balancing is handled
-    externally by AutomaticLossWeighter.
+    Calculates the raw mathematical losses
+    Task balancing is handled externally by AutomaticLossWeighter
 
-    Returns: d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
+    Returns: d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss
     """
 
-    # 1. Drape (weighted position MSE)
+    # 1. Drape (Position MSE)
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)
     d_loss = (sq_err * loss_weight).mean()
 
     pred_pos = template_pos + predicted_delta
     gt_pos   = template_pos + target_delta
 
-    # 2. Edge strain
+    # 2. Edge Strain
     e_loss = compute_edge_strain_loss(pred_pos, gt_pos, edge_index)
 
-    # Single sync for batch size / per-sample body IDs, reused below.
+    # Single sync for batch size / per-sample body IDs, reused below
     B = None
     body_ids_cpu = None
     if batch_idx is not None:
@@ -499,29 +546,23 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
             )
         col_loss = batch_col_loss / B
 
-    # Build offset face index tensor for batched normal/laplacian losses.
-    # Each garment in the batch has the same topology (fixed mesh), so we
-    # tile the face list and offset indices by N_per_garment * batch_item.
-    faces_batched_flat = None
-    if faces is not None and B is not None:
-        N_per = pred_pos.size(0) // B
-        offsets = torch.arange(B, device=faces.device) * N_per   # (B,)
-        # (B, F, 3) + (B, 1, 1) -> (B*F, 3)
-        faces_batched_flat = (
-            faces.unsqueeze(0) + offsets.view(B, 1, 1)
-        ).view(-1, 3)
-
-    # 4. Normal consistency (covers curvature and dihedral angles)
+    # 4. Normal consistency (GT-Aware to preserve wrinkles)
     n_loss = torch.zeros((), device=d_loss.device)
-    if use_normal_consistency and faces_batched_flat is not None:
-        n_loss = mesh_normal_consistency(pred_pos.float(), faces_batched_flat)
+    if use_normal_consistency and faces is not None and face_adj is not None and batch_idx is not None:
+        n_loss = compute_normal_consistency_loss(pred_pos, gt_pos, faces, face_adj, batch_idx)
 
-    # 5. Laplacian smoothness
+    # 5. Laplacian smoothness (GT-Aware, using PyG's built-in edge_index)
     lap_loss = torch.zeros((), device=d_loss.device)
-    if use_laplacian and faces_batched_flat is not None:
-        lap_loss = mesh_laplacian_smoothing(pred_pos.float(), faces_batched_flat)
+    if use_laplacian:
+        # Use deltas for Laplacian to cancel out the base template topology
+        lap_loss = compute_laplacian_loss(predicted_delta, target_delta, edge_index)
+            
+    # 6. Bending Energy
+    b_loss = torch.tensor(0.0, device=d_loss.device)
+    if use_bending_energy and faces is not None and face_adj is not None and shared_edges is not None and batch_idx is not None:
+        b_loss = compute_bending_energy_loss(pred_pos, gt_pos, faces, face_adj, shared_edges, batch_idx)
 
-    # 6. Auxiliary classification
+    # 7. Auxiliary classification
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
-    return d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
+    return d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss

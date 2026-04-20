@@ -1,24 +1,27 @@
 """
-train_v3_5.py — PATCHED
+===============================================================================
+Garment Drape Simulation — Training Pipeline (v3.5)
+===============================================================================
+Model:        NonbelieverDrapeModel (Hierarchical FiLM-GNN + DINOv2 + CNN Refiner)
+Description:  Trains a multi-scale graph neural network to predict 3D garment 
+              deformation (drape) over a target human body mesh. The architecture
+              decouples low-frequency global drape (GNN) from high-frequency 
+              wrinkle refinement (2D UV-CNN).
 
-Training loop for NonbelieverDrapeModel (DINO + Hierarchical GNN).
-Supports normal consistency and Laplacian losses via config flags.
-
-Patches relative to the original:
-  - gnn_layers: 8 -> 12 (makes skip indices [3, 7] genuinely mid-stack,
-    so the hierarchical fuser receives distinct features rather than
-    duplicating the final layer).
-  - Sentinel return dicts in train_epoch / val_epoch now match the
-    real return schema exactly (no missing 'collision', no phantom
-    'bending').
-  - build_loss_weighter and weighted_loss share a single source of
-    truth for task ordering (_active_task_names + _PRIOR_KEY) so they
-    can never drift out of sync.
-  - torch.compile switched from mode="reduce-overhead" (CUDA-graphs,
-    incompatible with dynamic shapes + pyKeOps + our Python control
-    flow) to mode="default".
-  - mean_vertex_error now returns a tensor; train-loop running sums
-    accumulate on-device and sync once per logging window.
+Key Features:
+    - On-Device Accumulation: Loss metrics are accumulated on the GPU to minimize
+      CPU-GPU sync bottlenecks during the epoch loops.
+    - O(N) Collision: Utilizes PyKeOps for memory-efficient (matrix-free) 
+      signed-distance penetration penalties against the body mesh.
+    - Physics Sextet: Evaluates shape via Position MSE, Asymmetric Edge Strain,
+      Normal Consistency, Dihedral Bending Energy, Laplacian Smoothness, and 
+      Surface Collision.
+    - Static Weighter: Loss terms are balanced using static physics priors 
+      via a frozen AutomaticLossWeighter.
+    - Metric Tracking: Early stopping and LR scheduling are strictly monitored 
+      by the physical Mean Vertex Error (MVE) in millimeters, isolating geometric
+      performance from auxiliary classification inflation.
+===============================================================================
 """
 
 import os
@@ -34,7 +37,7 @@ import torch.nn.functional as F
 import warnings
 warnings.filterwarnings("ignore", message="xFormers is not available")
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch_geometric.loader import DataLoader
 import gc
 gc.collect()
@@ -43,9 +46,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v3_5 import (
-    NonbelieverDrapeModel, AutomaticLossWeighter, drape_loss
-)
+from models_v3_5 import NonbelieverDrapeModel, AutomaticLossWeighter, drape_loss, build_face_adjacency
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -71,15 +72,15 @@ CONFIG = {
     'max_epochs':      2   if DEBUG else 100,
     'early_stop_patience': 15,
     'grad_clip':       1.0,
+    'accumulate_grad_batches': 4,
 
     # Optimiser
     'lr':              1e-4,
-    'weight_decay':    1e-4,
+    'weight_decay':    1e-2,
 
     # Scheduler
-    'lr_patience':     5,
-    'lr_factor':       0.5,
-    'lr_min':          1e-6,
+    'warmup_epochs':   5,    # Ramp up LR over first 5 epoch
+    'lr_min':          1e-6, # Final learning rate at max_epochs
 
     # Model
     'embed_dim':       128,
@@ -88,15 +89,17 @@ CONFIG = {
 
     # Surface quality losses (toggle on/off)
     'use_normal_consistency': True,
+    'use_bending_energy':     True,
     'use_laplacian':          True,
 
     # Loss priors for AutomaticLossWeighter (active-set order lives in
     # _active_task_names below — these are the values it looks up).
     'prior_drape':     1.0,
-    'prior_strain':    1.5,
-    'prior_normal':    8.0,
-    'prior_laplacian': 1.0,
-    'prior_collision': 2.0,
+    'prior_strain':    0.5,
+    'prior_normal':    2.0,
+    'prior_bending':   1.0,
+    'prior_laplacian': 0.5,
+    'prior_collision': 1.5,
     'prior_cls':       0.1,
 
     # Freeze the weighter so priors are the *final* effective weights
@@ -140,6 +143,7 @@ _PRIOR_KEY = {
     'cls':       'prior_cls',
     'collision': 'prior_collision',
     'normal':    'prior_normal',
+    'bending':   'prior_bending',
     'laplacian': 'prior_laplacian',
 }
 
@@ -147,6 +151,8 @@ def _active_task_names(cfg):
     names = ['drape', 'strain', 'cls', 'collision']
     if cfg['use_normal_consistency']:
         names.append('normal')
+    if cfg['use_bending_energy']:
+        names.append('bending')
     if cfg.get('use_laplacian', False):
         names.append('laplacian')
     return names
@@ -161,7 +167,7 @@ def build_loss_weighter(cfg, device):
     print(f"  Loss weighter: {len(priors)} tasks — {dict(zip(names, priors))}")
     return AutomaticLossWeighter(num_tasks=len(priors), priors=priors).to(device)
 
-def weighted_loss(loss_weighter, cfg, d_loss, e_loss, c_loss, col_loss, n_loss, lap_loss):
+def weighted_loss(loss_weighter, cfg, d_loss, e_loss, c_loss, col_loss, n_loss, b_loss, lap_loss):
     """Pack active losses in the same order build_loss_weighter used."""
     loss_map = {
         'drape':     d_loss,
@@ -169,6 +175,7 @@ def weighted_loss(loss_weighter, cfg, d_loss, e_loss, c_loss, col_loss, n_loss, 
         'cls':       c_loss,
         'collision': col_loss,
         'normal':    n_loss,
+        'bending':   b_loss,
         'laplacian': lap_loss,
     }
     names = _active_task_names(cfg)
@@ -179,7 +186,7 @@ def weighted_loss(loss_weighter, cfg, d_loss, e_loss, c_loss, col_loss, n_loss, 
 
 def train_epoch(model, loader, optimiser, device, config, epoch, logger,
                 amp_dtype, use_scaler, scaler, loss_weighter,
-                faces_t, get_body_data):
+                faces_t, face_adj, shared_edges, get_body_data):
     torch.cuda.empty_cache()
     model.train()
 
@@ -189,6 +196,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
     total_cls    = torch.zeros((), device=device)
     total_strain = torch.zeros((), device=device)
     total_normal = torch.zeros((), device=device)
+    total_bend   = torch.zeros((), device=device)
     total_lap    = torch.zeros((), device=device)
     total_col    = torch.zeros((), device=device)
     total_mve    = torch.zeros((), device=device)
@@ -197,22 +205,26 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
     for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
-        optimiser.zero_grad()
 
         with torch.amp.autocast('cuda', dtype=amp_dtype):
             predicted_delta, fabric_logits = model(batch)
 
-            d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss = drape_loss(
+            d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss = drape_loss(
                 predicted_delta, batch.y, batch.pos, batch.edge_index,
                 batch.loss_weight, fabric_logits, batch.fabric_family_label,
                 batch_idx=batch.batch, faces=faces_t,
+                face_adj=face_adj, shared_edges=shared_edges,
                 body_ids=batch.body_id, get_body_data=get_body_data,
                 use_normal_consistency=config['use_normal_consistency'],
-                use_laplacian=config.get('use_laplacian', False),
+                use_bending_energy=config['use_bending_energy'],
+                use_laplacian=config.get('use_laplacian', False)
             )
 
             loss = weighted_loss(loss_weighter, config,
-                                 d_loss, e_loss, c_loss, col_loss, n_loss, lap_loss)
+                                 d_loss, e_loss, c_loss, col_loss, n_loss, b_loss, lap_loss)
+            
+        # Scale loss to account for accumulation
+        loss = loss / config['accumulate_grad_batches']
 
         # NaN guard still forces one sync; that's unavoidable.
         if torch.isnan(loss):
@@ -221,14 +233,23 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
         if use_scaler:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimiser)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
-            scaler.step(optimiser)
-            scaler.update()
+            
+            # Only step the optimizer every N batches
+            if (batch_idx + 1) % config['accumulate_grad_batches'] == 0 or (batch_idx + 1) == len(loader):
+                scaler.unscale_(optimiser)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+                scaler.step(optimiser)
+                scaler.update()
+                optimiser.zero_grad() # Clear gradients ONLY after stepping
+
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
-            optimiser.step()
+            
+            # Only step the optimizer every N batches
+            if (batch_idx + 1) % config['accumulate_grad_batches'] == 0 or (batch_idx + 1) == len(loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+                optimiser.step()
+                optimiser.zero_grad() # Clear gradients ONLY after stepping
 
         with torch.no_grad():
             mve = mean_vertex_error(predicted_delta.detach(), batch.y)
@@ -237,6 +258,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
             total_cls    += c_loss.detach()
             total_strain += e_loss.detach()
             total_normal += n_loss.detach()
+            total_bend   += b_loss.detach()
             total_lap    += lap_loss.detach()
             total_col    += col_loss.detach()
             total_mve    += mve.detach()
@@ -249,6 +271,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
             avg_cls    = (total_cls    / n_batches).item()
             avg_strain = (total_strain / n_batches).item()
             avg_normal = (total_normal / n_batches).item()
+            avg_bend   = (total_bend   / n_batches).item()
             avg_lap    = (total_lap    / n_batches).item()
             avg_col    = (total_col    / n_batches).item()
             avg_mve    = (total_mve    / n_batches).item()
@@ -259,10 +282,10 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
             if logger:
                 step = (epoch - 1) * len(loader) + batch_idx
                 logger.log_train(step, avg_loss, avg_drape, avg_cls, avg_strain,
-                                 avg_mve, avg_normal, avg_lap, avg_col)
+                                 avg_mve, avg_normal, avg_bend, avg_lap, avg_col)
 
     # Sentinel fallback MUST match the regular return schema below.
-    empty_keys = ['loss', 'drape', 'cls', 'strain', 'normal',
+    empty_keys = ['loss', 'drape', 'cls', 'strain', 'normal', 'bending',
                   'laplacian', 'collision', 'mve']
     if n_batches == 0:
         return {k: float('nan') for k in empty_keys}
@@ -273,6 +296,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
         'cls':       (total_cls    / n_batches).item(),
         'strain':    (total_strain / n_batches).item(),
         'normal':    (total_normal / n_batches).item(),
+        'bending':   (total_bend   / n_batches).item(),
         'laplacian': (total_lap    / n_batches).item(),
         'collision': (total_col    / n_batches).item(),
         'mve':       (total_mve    / n_batches).item(),
@@ -283,7 +307,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
 @torch.no_grad()
 def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
-              faces_t, get_body_data, amp_dtype, split='val'):
+              faces_t, face_adj, shared_edges, get_body_data, amp_dtype, split='val'):
     torch.cuda.empty_cache()
     model.eval()
 
@@ -292,6 +316,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
     total_cls    = torch.zeros((), device=device)
     total_strain = torch.zeros((), device=device)
     total_normal = torch.zeros((), device=device)
+    total_bend   = torch.zeros((), device=device)
     total_lap    = torch.zeros((), device=device)
     total_col    = torch.zeros((), device=device)
     total_mve    = torch.zeros((), device=device)
@@ -306,17 +331,19 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
         with torch.amp.autocast('cuda', dtype=amp_dtype):
             predicted_delta, fabric_logits = model(batch)
 
-        d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss = drape_loss(
+        d_loss, e_loss, col_loss, n_loss, b_loss, lap_loss, c_loss = drape_loss(
             predicted_delta, batch.y, batch.pos, batch.edge_index,
             batch.loss_weight, fabric_logits, batch.fabric_family_label,
             batch_idx=batch.batch, faces=faces_t,
+            face_adj=face_adj, shared_edges=shared_edges,
             body_ids=batch.body_id, get_body_data=get_body_data,
             use_normal_consistency=config['use_normal_consistency'],
-            use_laplacian=config.get('use_laplacian', False),
+            use_bending_energy=config['use_bending_energy'],
+            use_laplacian=config.get('use_laplacian', False)
         )
 
         loss = weighted_loss(loss_weighter, config,
-                             d_loss, e_loss, c_loss, col_loss, n_loss, lap_loss)
+                             d_loss, e_loss, c_loss, col_loss, n_loss, b_loss, lap_loss)
 
         if torch.isnan(loss):
             continue
@@ -328,6 +355,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
         total_cls    += c_loss.detach()
         total_strain += e_loss.detach()
         total_normal += n_loss.detach()
+        total_bend   += b_loss.detach()
         total_lap    += lap_loss.detach()
         total_col    += col_loss.detach()
         total_mve    += mve.detach()
@@ -347,7 +375,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
                 seen_both_errs.append(err)
 
     # Sentinel fallback MUST match the regular return schema below.
-    empty_keys = ['loss', 'drape', 'cls', 'strain', 'normal',
+    empty_keys = ['loss', 'drape', 'cls', 'strain', 'normal', 'bending',
                   'laplacian', 'collision', 'mve']
     if n_batches == 0:
         return {k: float('nan') for k in empty_keys}
@@ -358,6 +386,7 @@ def val_epoch(model, loader, device, config, epoch, logger, loss_weighter,
         'cls':       (total_cls    / n_batches).item(),
         'strain':    (total_strain / n_batches).item(),
         'normal':    (total_normal / n_batches).item(),
+        'bending':   (total_bend   / n_batches).item(),
         'laplacian': (total_lap    / n_batches).item(),
         'collision': (total_col    / n_batches).item(),
         'mve':       (total_mve    / n_batches).item(),
@@ -400,13 +429,14 @@ class Logger:
                 self.use_wandb = False
 
     def log_train(self, step, loss, drape, cls, strain, mve,
-                  normal=0, laplacian=0, collision=0):
+                  normal=0, bending=0, laplacian=0, collision=0):
         if self.tb_writer:
             self.tb_writer.add_scalar('train/loss',           loss,      step)
             self.tb_writer.add_scalar('train/drape_loss',     drape,     step)
             self.tb_writer.add_scalar('train/cls_loss',       cls,       step)
             self.tb_writer.add_scalar('train/strain_loss',    strain,    step)
             self.tb_writer.add_scalar('train/normal_loss',    normal,    step)
+            self.tb_writer.add_scalar('train/bending_loss',   bending,   step)
             self.tb_writer.add_scalar('train/laplacian_loss', laplacian, step)
             self.tb_writer.add_scalar('train/collision_loss', collision, step)
             self.tb_writer.add_scalar('train/mve_mm',         mve,       step)
@@ -414,7 +444,7 @@ class Logger:
             import wandb
             wandb.log({'train/loss': loss, 'train/drape': drape, 'train/cls': cls,
                        'train/strain': strain, 'train/normal': normal,
-                       'train/laplacian': laplacian, 'train/collision': collision,
+                       'train/bending': bending, 'train/laplacian': laplacian, 'train/collision': collision,
                        'train/mve': mve, 'step': step})
 
     def log_val(self, epoch, results, split='val'):
@@ -509,11 +539,14 @@ def main():
     with open(os.path.join(run_dir, 'config.json'), 'w') as f:
         json.dump(cfg, f, indent=2)
 
-    # ── Load Template Faces ───────────────────────────────────────────────────
-    print("\nLoading template faces...")
+    # ── Precompute face adjacency ─────────────────────────────────────────────
+    print("\nPrecomputing face adjacency...")
     faces_np = np.load(os.path.join(args.data_root, 'template', 'faces.npy'))
     faces_t  = torch.from_numpy(faces_np.astype(np.int64)).to(device)
-    print(f"  Faces: {faces_t.shape}")
+    face_adj, shared_edges = build_face_adjacency(faces_np)
+    face_adj     = face_adj.to(device)
+    shared_edges = shared_edges.to(device)
+    print(f"  Faces: {faces_t.shape}  Adjacent pairs: {face_adj.shape[0]}")
 
     # ── Precompute Body Cache ─────────────────────────────────────────────────
     print("\nInitializing Body Cache for Collision...")
@@ -577,10 +610,18 @@ def main():
         optim_groups.append({'params': loss_weighter.parameters(), 'weight_decay': 0.0})
     optimiser = AdamW(optim_groups, lr=cfg['lr'], weight_decay=cfg['weight_decay'])
 
-    # Scheduler monitors val_mve (mm-space) instead of val_loss — val_loss is
-    # inflated by val_cls climbing on held-out heavy_woven fabrics.
-    scheduler = ReduceLROnPlateau(optimiser, mode='min', patience=cfg['lr_patience'],
-                                  factor=cfg['lr_factor'], min_lr=cfg['lr_min'], threshold=0.01)
+    # 1. Warmup: Start at 1% of the base LR and linearly scale to 100% over 5 epochs
+    warmup_scheduler = LinearLR(optimiser, start_factor=0.01, end_factor=1.0, 
+                                total_iters=cfg['warmup_epochs'])
+    
+    # 2. Cosine Annealing: Smoothly decay the LR down to lr_min for the remaining epochs
+    cosine_scheduler = CosineAnnealingLR(optimiser, 
+                                         T_max=cfg['max_epochs'] - cfg['warmup_epochs'], 
+                                         eta_min=cfg['lr_min'])
+    
+    # Chain them together
+    scheduler = SequentialLR(optimiser, schedulers=[warmup_scheduler, cosine_scheduler], 
+                             milestones=[cfg['warmup_epochs']])
 
     logger = Logger(run_dir, cfg, use_wandb=cfg['use_wandb'])
 
@@ -597,6 +638,7 @@ def main():
     print(f"TRAINING — {cfg['experiment_name']}{'  [DEBUG]' if debug else ''}")
     print(f"  GNN layers:         {cfg['gnn_layers']}")
     print(f"  Normal consistency: {'ON' if cfg['use_normal_consistency'] else 'OFF'}")
+    print(f"  Bending energy:     {'ON' if cfg['use_bending_energy'] else 'OFF'}")
     print(f"  Laplacian:          {'ON' if cfg.get('use_laplacian', False) else 'OFF'}")
     print(f"  Early-stop + LR scheduler monitor: val_mve (mm)")
     print(f"{'='*65}\n")
@@ -609,12 +651,12 @@ def main():
 
         train_metrics = train_epoch(model, train_loader, optimiser, device, cfg, epoch,
                                     logger, amp_dtype, use_scaler, scaler, loss_weighter,
-                                    faces_t, get_body_data)
+                                    faces_t, face_adj, shared_edges, get_body_data)
 
         val_metrics = val_epoch(model, val_loader, device, cfg, epoch, logger, loss_weighter,
-                                faces_t, get_body_data, amp_dtype, split='val')
+                                faces_t, face_adj, shared_edges, get_body_data, amp_dtype, split='val')
 
-        scheduler.step(val_metrics['mve'])
+        scheduler.step()
         current_lr = optimiser.param_groups[0]['lr']
         logger.log_lr(epoch, current_lr)
         epoch_time = time.time() - epoch_start
@@ -629,10 +671,10 @@ def main():
 
         if epoch % 10 == 0 or epoch == cfg['max_epochs']:
             print(f"           train d={train_metrics['drape']:.3f} s={train_metrics['strain']:.3f} "
-                  f"n={train_metrics['normal']:.4f} "
+                  f"n={train_metrics['normal']:.4f} b={train_metrics['bending']:.4f}"
                   f"lap={train_metrics['laplacian']:.4f} cls={train_metrics['cls']:.3f} | "
                   f"val d={val_metrics['drape']:.3f} s={val_metrics['strain']:.3f} "
-                  f"n={val_metrics['normal']:.4f} "
+                  f"n={val_metrics['normal']:.4f} b={val_metrics['bending']:.4f}"
                   f"lap={val_metrics['laplacian']:.4f} cls={val_metrics['cls']:.3f}")
             if 'mve_heavy_woven' in val_metrics:
                 print(f"  heavy_woven: {val_metrics.get('mve_heavy_woven', float('nan')):.2f}mm  "
