@@ -1,54 +1,61 @@
 """
-models_v3.5.py (Hierarchical Multi-Scale Architecture)
+models_v3_5.py (Hierarchical Multi-Scale Architecture) — PATCHED
 
-NonbelieverDrapeModel: 
+NonbelieverDrapeModel:
 DINOv2 + FiLM-GNN + U-Net Skip Fusion + 2D UV-Refinement + Physics Septet Loss
 
-This model moves beyond global shape prediction to capture high-frequency 
-surface details (folds, wrinkles) by decoupling global drape from local 
-geometric refinement.
+Patches applied relative to the original v3.5:
+  - UVRefinementNet:
+      * vectorized scatter-add (no Python batch loop)
+      * UVs clamped to [0, 1] before indexing (prevents OOB on seam verts)
+      * final Conv2d zero-initialized so the refinement head starts as
+        identity; base GNN drives early training before the refiner kicks in
+      * default `grid_res=128` as an explicit int (was `grid_res=LATENT_DIM`)
+  - compute_collision_penalty:
+      * version-robust unpacking of `LazyTensor.min_argmin` (handles both
+        tuple and (N, 2) tensor returns across pyKeOps versions)
+      * float32 promotion so PyKeOps works correctly under bfloat16 autocast
+      * comment clarified: penalty is linear in penetration depth with a
+        small threshold floor for near-surface interior points
+  - drape_loss:
+      * pytorch3d removed entirely — mesh_normal_consistency and
+        mesh_laplacian_smoothing replaced with pure PyTorch implementations
+      * `body_ids.tolist()` once per call instead of `.item()` per sample
+      * single `B = batch_idx.max().item()` sync, reused for both the
+        collision loop and the mesh loss construction
 
-Key Architectural Features:
+Architecture notes (unchanged):
 -------------------------------------------------------------------------------
 1. Vision Backbone (Style & Texture):
-   - StyleViT_DINO: Frozen DINOv2-Small (vits14) acts as a high-level feature 
-     extractor. It provides a 128-dim global 'style' embedding that encodes 
+   - StyleViT_DINO: Frozen DINOv2-Small (vits14) acts as a high-level feature
+     extractor. It provides a 128-dim global 'style' embedding that encodes
      material properties (stiffness, weight) and visual context.
 
 2. Conditioning Engine (FiLM):
-   - Feature-wise Linear Modulation: Style, SMPL betas, Physics params, and 
+   - Feature-wise Linear Modulation: Style, SMPL betas, Physics params, and
      Size encodings are fused into a 150-dim global context vector.
-   - Per-layer FiLM Generators: Every GNN block receives a unique scale (gamma) 
-     and shift (beta) based on this context, allowing the global state to 
+   - Per-layer FiLM Generators: Every GNN block receives a unique scale (gamma)
+     and shift (beta) based on this context, allowing the global state to
      dynamically 'steer' the local vertex updates.
 
 3. Core Processor (Hierarchical GNN):
-   - U-Net Style Skip Connections: Captures features at multiple scales. 
-     Features from early (global drape), middle, and late (local detail) 
+   - U-Net Style Skip Connections: Captures features at multiple scales.
+     Features from early (global drape), middle, and late (local detail)
      layers are concatenated and fused via a Hierarchical Fuser MLP.
-   - Deep Message Passing: 12 FiLMMeshBlocks enable long-range signal 
+   - Deep Message Passing: 12 FiLMMeshBlocks enable long-range signal
      propagation across the 14,117-node mesh.
 
 4. 2D UV-Space Refinement Head (CNN Detailer):
-   - Spatial Detail Projection: GNN node features are mapped onto a 128x128 
+   - Spatial Detail Projection: GNN node features are mapped onto a 128x128
      2D grid based on vertex UV coordinates.
-   - 2D ResNet Refiner: Uses 2D convolutions to 'paint' high-frequency 
+   - 2D ResNet Refiner: Uses 2D convolutions to 'paint' high-frequency
      displacement maps, capturing sharp wrinkles that GNNs naturally smooth out.
-   - Grid Sampling: Refined displacements are sampled back to vertices and 
+   - Grid Sampling: Refined displacements are sampled back to vertices and
      added to the base GNN prediction.
 
 5. Physics Septet Loss (Training Objectives):
-   - Position (MVE): Standard MSE for global coordinate accuracy.
-   - Asymmetric Strain: Penalizes extension (stretching) 10x more than 
-     compression, forcing the fabric to buckle into realistic folds.
-   - Collision Penalty: Corrected logic that uses body surface normals to 
-     force fabric outside the skin, creating physical pressure.
-   - Normal Consistency and Bending Energy:
-     High-priority cosine similarity to ensure wrinkles face the correct physical direction.
-     Dihedral angle penalty to maintain soft fabric sweeps.
-   - Laplacian Smoothness: MM-space penalty to eliminate 'orange-peel' mesh 
-     noise and jittery vertices.
-   - Aux Classification: Forces the backbone to distinguish material families.
+   - Position (MVE), Asymmetric Strain, Collision, Normal Consistency,
+     Laplacian Smoothness, Aux Classification.
 -------------------------------------------------------------------------------
 """
 
@@ -57,8 +64,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
 from pykeops.torch import LazyTensor
-from pytorch3d.structures import Meshes
-from pytorch3d.loss import mesh_laplacian_smoothing, mesh_normal_consistency
 
 # ── Dimensions ───────────────────────────────────────────────────────────────
 
@@ -78,6 +83,8 @@ NUM_FABRIC_FAMILIES = 6
 
 NODE_IN_DIM = NODE_POS_DIM + NODE_UV_DIM + NODE_NORMAL_DIM
 GLOBAL_COND_DIM = STYLE_DIM + SMPL_DIM + PHYSICS_DIM + SIZE_DIM
+
+UV_GRID_RES = 128  # explicit UV refinement grid resolution (decoupled from LATENT_DIM)
 
 
 # ── Utility Builders ─────────────────────────────────────────────────────────
@@ -162,10 +169,25 @@ class AutomaticLossWeighter(nn.Module):
             task_loss = (precision * loss) + self.log_vars[i]
             total_loss += self.priors[i] * task_loss
         return total_loss
-    
+
+
 # ── UV Refinement Head ───────────────────────────────────────────────────────
+
 class UVRefinementNet(nn.Module):
-    def __init__(self, latent_dim=LATENT_DIM, grid_res=LATENT_DIM):
+    """
+    Projects GNN features onto a 2D UV grid, runs a small CNN to paint
+    high-frequency displacement detail, and samples back to vertices.
+
+    Notes:
+      - UVs are clamped to [0, 1] before indexing to prevent out-of-bounds
+        index_add_ on seam vertices or numerically-overshoot UVs.
+      - The final Conv2d is zero-initialized so that at step 0 this module
+        contributes zero `fine_delta`. The base GNN drives early training
+        and the refiner learns residual corrections.
+      - Scatter-add is vectorized with a single `index_add_` into a flat
+        (B*R*R, C) buffer; no Python loop over batch samples.
+    """
+    def __init__(self, latent_dim=LATENT_DIM, grid_res=UV_GRID_RES):
         super().__init__()
         self.res = grid_res
         hidden_dim = latent_dim // 2
@@ -174,43 +196,46 @@ class UVRefinementNet(nn.Module):
             nn.ReLU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.ReLU(),
-            nn.Conv2d(hidden_dim, NODE_POS_DIM, kernel_size=1) # Fine-grained Delta X, Y, Z
+            nn.Conv2d(hidden_dim, NODE_POS_DIM, kernel_size=1),  # delta x,y,z per pixel
         )
+        # Zero-init final conv so the refinement head begins as identity.
+        nn.init.zeros_(self.net[-1].weight)
+        if self.net[-1].bias is not None:
+            nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x, uvs, batch_idx):
-        # x: (N, latent_dim), uvs: (N, 2), batch_idx: (N,)
-        # This is a simplified projection for v3.5
-        B = batch_idx.max().item() + 1
-        grid = torch.zeros((B, x.size(1), self.res, self.res), device=x.device, dtype=x.dtype)
-        
-        # Map [0,1] UVs to grid indices
-        coords = (uvs * (self.res - 1)).long()
-        for i in range(B):
-            mask = (batch_idx == i)
-            y_idx = coords[mask, 1]
-            x_idx = coords[mask, 0]
-            
-            # Create a tuple of indices for the (C, H, W) grid
-            # We broadcast the channel dimension to match the nodes
-            C = x.size(1)
-            num_nodes = mask.sum().item()
-            c_idx = torch.arange(C, device=x.device).view(C, 1).expand(C, num_nodes)
-            y_idx_expand = y_idx.view(1, num_nodes).expand(C, num_nodes)
-            x_idx_expand = x_idx.view(1, num_nodes).expand(C, num_nodes)
-            
-            # Safely accumulate features without overwriting overlapping UVs
-            grid[i].index_put_((c_idx.flatten(), y_idx_expand.flatten(), x_idx_expand.flatten()),
-                               x[mask].t().flatten(), accumulate=True)
-            
-        refinement_map = self.net(grid) # (B, 3, res, res)
-        
-        # Sample back to mesh vertices
+        # x: (N, C), uvs: (N, 2) in [0,1], batch_idx: (N,) long
+        B = int(batch_idx.max().item()) + 1
+        C = x.size(1)
+        R = self.res
+
+        # Clamp UVs to valid range before integer indexing.
+        uvs_safe = uvs.clamp(0.0, 1.0)
+        coords = (uvs_safe * (R - 1)).long()  # (N, 2) with (u_idx, v_idx)
+        u_idx = coords[:, 0]
+        v_idx = coords[:, 1]
+
+        # Flat index into a (B*R*R, C) buffer. Layout: (b, v, u) -> b*R*R + v*R + u.
+        flat_idx = batch_idx * (R * R) + v_idx * R + u_idx  # (N,)
+
+        flat_grid = torch.zeros((B * R * R, C), device=x.device, dtype=x.dtype)
+        flat_grid.index_add_(0, flat_idx, x)  # handles overlapping UVs correctly
+
+        # Reshape to (B, C, R, R): (B, v=H, u=W, C) -> permute channels up.
+        grid = flat_grid.view(B, R, R, C).permute(0, 3, 1, 2).contiguous()
+
+        refinement_map = self.net(grid)  # (B, 3, R, R)
+
+        # Sample back to mesh vertices. grid_sample's last-dim convention is
+        # (x_W, y_H); we stored u along W and v along H, so (u, v) is correct.
+        # Requires equal nodes-per-sample (true for this fixed-topology mesh).
+        sample_grid = uvs_safe.view(B, -1, 1, NODE_UV_DIM) * 2.0 - 1.0
         fine_delta = F.grid_sample(
-            refinement_map, 
-            (uvs.view(B, -1, 1, NODE_UV_DIM) * 2 - 1), # Norm to [-1, 1]
-            align_corners=True
+            refinement_map,
+            sample_grid,
+            align_corners=True,
         ).view(B, NODE_POS_DIM, -1).permute(0, 2, 1).reshape(-1, NODE_POS_DIM)
-        
+
         return fine_delta
 
 
@@ -230,11 +255,11 @@ class NonbelieverDrapeModel(nn.Module):
         self.film_generators = nn.ModuleList([nn.Linear(GLOBAL_COND_DIM, latent_dim * 2) for _ in range(gnn_layers)])
 
         # 4. Hierarchical Skip Connections (U-Net style)
-        # Concatenates features from layers 4, 8 to blend global drape with local detail
+        # With gnn_layers=8, skip indices [3, 7] correspond to layers 4 and 8
+        # (~1/2 and end of stack), distinct from the final x.
         self.hierarchical_fuser = nn.Linear(latent_dim * 3, latent_dim)
-        
-        # 5. 2D vision-based refinement head
-        # Specifically targets high-frequency wrinkles by processing GNN features in 2D image space
+
+        # 5. 2D vision-based refinement head (zero-init residual)
         self.uv_refiner = UVRefinementNet(latent_dim)
 
         # 6. Decoders
@@ -243,10 +268,9 @@ class NonbelieverDrapeModel(nn.Module):
 
     def forward(self, data):
         # A. Vision Feature Extraction
-        style_emb = self.vit(data.image) # (B, 128)
+        style_emb = self.vit(data.image)  # (B, 128)
 
         # B. Context Injection (FiLM)
-        # Fuses Style, SMPL, Physics, and Size into a steering vector
         global_cond = torch.cat([
             style_emb,
             data.tgt_smpl.view(-1, SMPL_DIM),
@@ -263,92 +287,173 @@ class NonbelieverDrapeModel(nn.Module):
         # D. Processor Loop with Hierarchical Capture
         skip_features = []
         for i, layer in enumerate(self.processor):
-            # FiLM modulation
             film_params = self.film_generators[i](global_cond)
             gamma, beta = torch.chunk(film_params[b], 2, dim=-1)
-            
-            # Message Passing
             x, edge_attr = layer(x, data.edge_index, edge_attr, gamma, beta)
-
-            # Save intermediate outputs for the U-Net skip fusion
-            if i in [3, 7]: # Layers 4 and 8
+            # Snapshot middle-of-stack features for the U-Net skip fusion.
+            if i in [3, 7]:
                 skip_features.append(x)
 
         # E. Multi-Scale Fusion
-        # Fuses the final output with earlier "global" snapshots
         x = self.hierarchical_fuser(torch.cat([x] + skip_features, dim=-1))
 
         # F. Dual-Head Prediction
         base_delta = self.decoder(x)
-        
-        # G. High-frequency wrinkle detail from the CNN head
+
+        # G. High-frequency wrinkle detail (starts as zero due to init)
         fine_delta = self.uv_refiner(x, data.uvs, data.batch)
 
-        # Output classification for auxiliary loss
         fabric_logits = self.fabric_classifier(style_emb)
-        
+
         return base_delta + fine_delta, fabric_logits
 
 
-# ── Loss: Edge Strain (Asymmetric) ────────────────────────────────────────────
+# ── Loss: Edge Strain (Asymmetric) ───────────────────────────────────────────
 
 def compute_edge_strain_loss(pred_pos, gt_pos, edge_index, w_ext=5.0, w_comp=0.5):
     row, col = edge_index
     pred_len = torch.norm(pred_pos[row] - pred_pos[col], dim=1)
     gt_len   = torch.norm(gt_pos[row]   - gt_pos[col],   dim=1)
-    
+
     diff = pred_len - gt_len
-    # Penalize extension more heavily than compression
-    strain_sq = torch.where(diff > 0, w_ext * (diff**2), w_comp * (diff**2))
+    # Penalize extension (stretching) more heavily than compression to
+    # encourage realistic fabric buckling.
+    strain_sq = torch.where(diff > 0, w_ext * (diff ** 2), w_comp * (diff ** 2))
     return strain_sq.mean()
 
 
-# ── Loss: Collision Penalty ───────────────────────────────────────────────────
+# ── Loss: Normal Consistency (pure PyTorch) ───────────────────────────────────
+
+def mesh_normal_consistency(pred_pos, faces):
+    """
+    Vectorized normal consistency loss — pure PyTorch, no pytorch3d required.
+
+    For every pair of faces sharing an edge, penalizes the cosine distance
+    between their normals. Encourages smooth, physically-plausible surface
+    curvature and correct wrinkle orientation.
+
+    Args:
+        pred_pos : (N, 3) vertex positions (flat batch, faces already offset)
+        faces    : (F, 3) long — triangle indices into pred_pos
+    """
+    v0 = pred_pos[faces[:, 0]]
+    v1 = pred_pos[faces[:, 1]]
+    v2 = pred_pos[faces[:, 2]]
+    face_normals = F.normalize(torch.cross(v1 - v0, v2 - v0, dim=-1), dim=-1)  # (F, 3)
+
+    F_count = faces.size(0)
+    # Each face contributes 3 half-edges; sort each so (a,b)==(b,a).
+    edges = torch.cat([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [0, 2]]], dim=0)  # (3F, 2)
+    face_for_edge = torch.arange(F_count, device=faces.device).repeat(3)             # (3F,)
+    edge_key = edges.sort(dim=1).values                                               # (3F, 2)
+
+    _, inverse, counts = torch.unique(edge_key, return_inverse=True, return_counts=True, dim=0)
+
+    # Only manifold edges (shared by exactly 2 faces) contribute.
+    shared_mask = (counts == 2)[inverse]                    # (3F,) bool
+    shared_indices = torch.where(shared_mask)[0]            # indices into 3F
+    shared_inverse = inverse[shared_mask]
+
+    # Sort so paired half-edges are adjacent.
+    sort_order = shared_inverse.argsort(stable=True)
+    sorted_indices = shared_indices[sort_order]
+
+    face_a = face_for_edge[sorted_indices[0::2]]
+    face_b = face_for_edge[sorted_indices[1::2]]
+
+    cos_sim = (face_normals[face_a] * face_normals[face_b]).sum(dim=-1)
+    return (1.0 - cos_sim).mean()
+
+
+# ── Loss: Laplacian Smoothing (pure PyTorch) ──────────────────────────────────
+
+def mesh_laplacian_smoothing(pred_pos, faces):
+    """
+    Vectorized uniform Laplacian smoothing loss — pure PyTorch, no pytorch3d.
+
+    Penalizes each vertex for deviating from the mean of its neighbors,
+    suppressing high-frequency 'orange-peel' mesh noise and jittery verts.
+
+    Args:
+        pred_pos : (N, 3) vertex positions (flat batch, faces already offset)
+        faces    : (F, 3) long — triangle indices into pred_pos
+    """
+    N = pred_pos.size(0)
+    # Collect all directed edges from the face list.
+    edges = torch.cat([
+        faces[:, [0, 1]], faces[:, [1, 0]],
+        faces[:, [1, 2]], faces[:, [2, 1]],
+        faces[:, [0, 2]], faces[:, [2, 0]],
+    ], dim=0)
+    src, dst = edges[:, 0], edges[:, 1]
+
+    neighbor_sum = torch.zeros_like(pred_pos)
+    neighbor_sum.index_add_(0, src, pred_pos[dst])
+
+    degree = torch.zeros(N, 1, device=pred_pos.device, dtype=pred_pos.dtype)
+    ones   = torch.ones(src.size(0), 1, device=pred_pos.device, dtype=pred_pos.dtype)
+    degree.index_add_(0, src, ones)
+    degree = degree.clamp_min(1.0)
+
+    laplacian = pred_pos - neighbor_sum / degree
+    return (laplacian ** 2).sum(dim=-1).mean()
+
+
+# ── Loss: Collision Penalty ──────────────────────────────────────────────────
+
+def _unpack_min_argmin(result):
+    """Robust unpacking across pyKeOps versions.
+
+    pyKeOps has returned `min_argmin` as either:
+      - a tuple/list of two tensors (min_values, argmin_indices)
+      - a single tensor of shape (..., 2) with [min, argmin] along last dim
+    """
+    if isinstance(result, (tuple, list)):
+        return result[0], result[1]
+    return result[..., 0:1], result[..., 1:2]
+
 
 def compute_collision_penalty(pred_pos, body_pos, body_normals, threshold=0.002):
     """
-    Memory-free collision penalty using PyKeOps.
-    Operates in O(N) VRAM instead of O(N*M).
+    Memory-free collision penalty using PyKeOps. O(N) VRAM.
+
+    For vertices judged to be inside the body (via body-normal dot product),
+    the penalty is linear in distance-to-nearest-surface with a small
+    threshold floor, so even grazing-interior points incur a non-zero
+    gradient that pushes them outward.
+
+    PyKeOps only supports float32/float64 — under autocast (bfloat16 or
+    float16) pred_pos arrives in a low-precision dtype, so we promote all
+    inputs to float32 before any LazyTensor construction.
     """
-    # 1. Create LazyTensors with virtual axes
-    # pred_pos becomes an (N, 1, 3) virtual tensor (Axis i)
+    pred_pos     = pred_pos.float()
+    body_pos     = body_pos.float()
+    body_normals = body_normals.float()
+
     x_i = LazyTensor(pred_pos.view(-1, 1, 3))
-    
-    # body_pos becomes a (1, M, 3) virtual tensor (Axis j)
     y_j = LazyTensor(body_pos.view(1, -1, 3))
-    
-    # 2. Symbolic distance calculation
-    # This does NOT compute the matrix yet. It just defines the math.
-    D_ij = ((x_i - y_j) ** 2).sum(-1) 
-    
-    # 3. Kernel Execution: Find the minimum and its index
-    # KeOps compiles and runs the C++ kernel here.
-    min_sq_dist, nearest_idx = D_ij.min_argmin(dim=1)
-    
-    # KeOps returns shapes (N, 1). Flatten them to match standard PyTorch.
+
+    D_ij = ((x_i - y_j) ** 2).sum(-1)
+
+    min_sq_dist, nearest_idx = _unpack_min_argmin(D_ij.min_argmin(dim=1))
     min_sq_dist = min_sq_dist.view(-1)
-    nearest_idx = nearest_idx.view(-1).long() # Indices must be integers
-    
-    # Convert squared distance back to actual distance
-    min_dist = torch.sqrt(min_sq_dist)
-    
-    # 4. Standard PyTorch logic for penetration depth
-    nearest_normals = body_normals[nearest_idx]
+    nearest_idx = nearest_idx.view(-1).long()
+
+    min_dist = torch.sqrt(min_sq_dist.clamp_min(0.0))  # numerical guard
+
+    nearest_normals   = body_normals[nearest_idx]
     direction_vectors = pred_pos - body_pos[nearest_idx]
-    
-    # Dot product < 0 means the garment is inside the skin
+
     inside_mask = (torch.sum(direction_vectors * nearest_normals, dim=1) < 0)
-    
+
     if not inside_mask.any():
-        return (pred_pos.sum() * 0.0)
-    
-    # Penalize deeper penetrations more heavily
+        return pred_pos.sum() * 0.0  # zero with gradient attached
+
     collision_error = min_dist[inside_mask] + threshold
-    
     return collision_error.mean()
 
 
-# ── Combined Loss Function ────────────────────────────────────────────────────
+# ── Combined Loss Function ───────────────────────────────────────────────────
 
 def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_weight,
                fabric_logits, fabric_labels,
@@ -356,64 +461,67 @@ def drape_loss(predicted_delta, target_delta, template_pos, edge_index, loss_wei
                body_ids=None, get_body_data=None,
                use_normal_consistency=False, use_laplacian=False):
     """
-    Calculates the raw mathematical losses. 
-    Task balancing is handled externally by AutomaticLossWeighter.
+    Calculates the raw mathematical losses. Task balancing is handled
+    externally by AutomaticLossWeighter.
 
     Returns: d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
     """
 
-    # 1. Drape (Position MSE)
+    # 1. Drape (weighted position MSE)
     sq_err = ((predicted_delta - target_delta) ** 2).sum(dim=-1)
     d_loss = (sq_err * loss_weight).mean()
 
     pred_pos = template_pos + predicted_delta
     gt_pos   = template_pos + target_delta
 
-    # 2. Edge Strain
+    # 2. Edge strain
     e_loss = compute_edge_strain_loss(pred_pos, gt_pos, edge_index)
 
-    # 3. Collision Penalty (AUTOMATED PER-SAMPLE LOOP)
-    col_loss = torch.tensor(0.0, device=d_loss.device)
-    if body_ids is not None and get_body_data is not None and batch_idx is not None:
-        B = batch_idx.max().item() + 1
-        batch_col_loss = 0.0
-        for i in range(B):
-            b_id = body_ids[i].item()
+    # Single sync for batch size / per-sample body IDs, reused below.
+    B = None
+    body_ids_cpu = None
+    if batch_idx is not None:
+        if body_ids is not None:
+            body_ids_cpu = body_ids.tolist()
+            B = len(body_ids_cpu)
+        else:
+            B = int(batch_idx.max().item()) + 1
+
+    # 3. Collision penalty (per-sample, mean across batch)
+    col_loss = torch.zeros((), device=d_loss.device)
+    if body_ids_cpu is not None and get_body_data is not None and B is not None:
+        batch_col_loss = torch.zeros((), device=d_loss.device)
+        for i, b_id in enumerate(body_ids_cpu):
             b_pos, b_norm = get_body_data(b_id, d_loss.device)
             mask = (batch_idx == i)
-            batch_col_loss += compute_collision_penalty(pred_pos[mask], b_pos, b_norm)
+            batch_col_loss = batch_col_loss + compute_collision_penalty(
+                pred_pos[mask], b_pos, b_norm
+            )
         col_loss = batch_col_loss / B
 
-    # Initialize PyTorch3D Meshes. 
-    # By passing lists of length 1, PyTorch3D treats the PyG batch as one giant mesh.
-    garment_meshes = None
-    if faces is not None and batch_idx is not None:
-        B = batch_idx.max().item() + 1
-        N = pred_pos.size(0) // B  # Number of vertices per garment (e.g., 14117)
+    # Build offset face index tensor for batched normal/laplacian losses.
+    # Each garment in the batch has the same topology (fixed mesh), so we
+    # tile the face list and offset indices by N_per_garment * batch_item.
+    faces_batched_flat = None
+    if faces is not None and B is not None:
+        N_per = pred_pos.size(0) // B
+        offsets = torch.arange(B, device=faces.device) * N_per   # (B,)
+        # (B, F, 3) + (B, 1, 1) -> (B*F, 3)
+        faces_batched_flat = (
+            faces.unsqueeze(0) + offsets.view(B, 1, 1)
+        ).view(-1, 3)
 
-        # Reshape from flat (B*N, 3) to batched (B, N, 3)
-        pred_pos_batched = pred_pos.view(B, N, 3)
-        
-        # Expand template faces from (F, 3) to (B, F, 3)
-        faces_batched = faces.unsqueeze(0).expand(B, -1, -1)
+    # 4. Normal consistency (covers curvature and dihedral angles)
+    n_loss = torch.zeros((), device=d_loss.device)
+    if use_normal_consistency and faces_batched_flat is not None:
+        n_loss = mesh_normal_consistency(pred_pos.float(), faces_batched_flat)
 
-        garment_meshes = Meshes(verts=pred_pos_batched, faces=faces_batched)
+    # 5. Laplacian smoothness
+    lap_loss = torch.zeros((), device=d_loss.device)
+    if use_laplacian and faces_batched_flat is not None:
+        lap_loss = mesh_laplacian_smoothing(pred_pos.float(), faces_batched_flat)
 
-    # 4 & 5. Normal Consistency & Bending Energy
-    # PyTorch3D's mesh_normal_consistency handles both curvature and dihedral angles 
-    # in a single highly optimized C++ kernel.
-    n_loss = torch.tensor(0.0, device=d_loss.device)    
-    if use_normal_consistency and garment_meshes is not None:
-        # This replaces both the previous normal and bending functions
-        n_loss = mesh_normal_consistency(garment_meshes)
-
-    # 6. Laplacian Smoothness (toggle via flag)
-    lap_loss = torch.tensor(0.0, device=d_loss.device)
-    if use_laplacian and garment_meshes is not None:
-        # Replaces manual node-degree gathering with a sparse matrix multiplication
-        lap_loss = mesh_laplacian_smoothing(garment_meshes, method="uniform")
-    
-    # 7. Aux Classification
+    # 6. Auxiliary classification
     c_loss = F.cross_entropy(fabric_logits, fabric_labels)
 
     return d_loss, e_loss, col_loss, n_loss, lap_loss, c_loss
