@@ -70,6 +70,9 @@ Usage:
     # Scientific run (with baselines)
     # This will take slightly longer because it has to load the entire train dataset into memory to calculate the Mean Predictor
     python eval_v3_5.py --checkpoint runs/method2_master/checkpoints/best.pt --baselines
+
+    # With everything
+    python eval_v3_5.py --checkpoint runs/method1_baseline/checkpoints/best.pt --save-meshes --baselines
 """
 
 import os
@@ -310,9 +313,14 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
                 # 1. Isolate the specific graph
                 mask = (batch.batch == i)
                 edge_mask = (batch.batch[batch.edge_index[0]] == i)
+
+                # Keep a PyTorch Tensor version on the GPU for KeOps Collision
+                p_verts_tensor = batch.pos[mask] + pred_delta[mask]
+                g_verts_tensor = batch.pos[mask] + batch.y[mask]
                 
-                p_verts = (batch.pos[mask] + pred_delta[mask]).cpu().numpy()
-                g_verts = (batch.pos[mask] + batch.y[mask]).cpu().numpy()
+                # Create Numpy versions for SciPy calculations (Chamfer, IoU, MVE)
+                p_verts = p_verts_tensor.cpu().numpy()
+                g_verts = g_verts_tensor.cpu().numpy()
 
                 # --- COLLISION CALCULATION ---
                 if get_body_data is not None:
@@ -321,8 +329,9 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
                     
                     # Import the function from models_v3_5
                     from models_v3_5 import compute_collision_penalty
+
                     # We use threshold=0 here to measure pure raw penetration depth
-                    col_val = compute_collision_penalty(p_verts, b_pos, b_norm, threshold=0.0)
+                    col_val = compute_collision_penalty(p_verts_tensor, b_pos, b_norm, threshold=0.0)
                     metrics['collision'].append(col_val.item())
                 
                 # 2. Calculate Core Metrics
