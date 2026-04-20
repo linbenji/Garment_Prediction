@@ -203,6 +203,9 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
     n_batches    = 0
     start_time   = time.time()
 
+    # SAFEGUARD: Ensure gradients are totally clean before starting accumulation
+    optimiser.zero_grad()
+
     for batch_idx, batch in enumerate(loader):
         batch = batch.to(device)
 
@@ -222,6 +225,9 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
             loss = weighted_loss(loss_weighter, config,
                                  d_loss, e_loss, c_loss, col_loss, n_loss, b_loss, lap_loss)
+            
+        # Detach and save the true unscaled loss for accurate logging
+        unscaled_loss = loss.detach()
             
         # Scale loss to account for accumulation
         loss = loss / config['accumulate_grad_batches']
@@ -253,7 +259,7 @@ def train_epoch(model, loader, optimiser, device, config, epoch, logger,
 
         with torch.no_grad():
             mve = mean_vertex_error(predicted_delta.detach(), batch.y)
-            total_loss   += loss.detach()
+            total_loss   += unscaled_loss
             total_drape  += d_loss.detach()
             total_cls    += c_loss.detach()
             total_strain += e_loss.detach()
@@ -640,7 +646,8 @@ def main():
     print(f"  Normal consistency: {'ON' if cfg['use_normal_consistency'] else 'OFF'}")
     print(f"  Bending energy:     {'ON' if cfg['use_bending_energy'] else 'OFF'}")
     print(f"  Laplacian:          {'ON' if cfg.get('use_laplacian', False) else 'OFF'}")
-    print(f"  Early-stop + LR scheduler monitor: val_mve (mm)")
+    print(f"  Early-stop monitor: val_mve (mm)")
+    print(f"  LR Scheduler:       Cosine Annealing w/ Warmup")
     print(f"{'='*65}\n")
 
     history = []
