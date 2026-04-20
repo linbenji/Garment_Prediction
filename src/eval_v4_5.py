@@ -1,16 +1,26 @@
 """
 ===============================================================================
-EVALUATION PIPELINE: UnfrozenCLSDrapeModel (v4)
+EVALUATION PIPELINE: UnfrozenPatchDrapeModel (v4.5)
 ===============================================================================
 
-Merges the full metric suite from eval_v3 with the v4 model architecture
-(UnfrozenCLSDrapeModel with optional cross-attention layers).
+v4.5 changes vs v4:
+  - Vision backbone: StyleViT_DINO_LoRA_Patch — exposes all 196 patch tokens
+    in addition to the CLS token, allowing each mesh vertex to attend to the
+    specific image region it corresponds to via full softmax cross-attention.
+  - LoRA rank=8 / alpha=16  (doubled from v4's rank=4 / alpha=8).
+  - FiLM conditioning uses patch_mean (mean of 196 patch tokens) instead of
+    the CLS style embedding, so global conditioning also benefits from spatial
+    patch information.
+
+All evaluation logic (metrics, bucketing, plots, mesh saving) is identical to
+eval_v4.py. Only the import and model instantiation differ.
 
 Step-by-Step Execution Flow:
 -------------------------------------------------------------------------------
 1. Initialization & Loading
    - Loads the saved checkpoint (.pt) and extracts the architecture config.
-   - Instantiates UnfrozenCLSDrapeModel (restoring cross_attn_layers from cfg).
+   - Instantiates UnfrozenPatchDrapeModel (restoring cross_attn_layers,
+     lora_rank, lora_alpha from cfg; defaults rank=8, alpha=16).
    - Initialises GarmentDataset for the requested split (usually 'test').
    - Forces front-facing camera angle (dataloader_v2.CAMERA_ANGLES = ['000']).
 
@@ -32,7 +42,7 @@ Step-by-Step Execution Flow:
 4. Categorization & Bucketing
    - By Fabric Family
    - By Target Size
-   - By Generalization Condition (v4 bucketing — heavy_woven is the unseen family):
+   - By Generalization Condition (heavy_woven is the unseen fabric family):
        seen_body_seen_mat         | body_id <= 22, fab_group <= 5
        seen_body_unseen_mat_val   | body_id <= 12, fab_group == 6
        seen_body_unseen_mat_test  | body_id <= 22, fab_group == 6
@@ -53,16 +63,16 @@ Step-by-Step Execution Flow:
 
 Usage:
     # Evaluate best checkpoint on test split
-    python eval_v4.py --checkpoint runs/method3_crossattn/checkpoints/best.pt
+    python eval_v4_5.py --checkpoint runs/method4_patch/checkpoints/best.pt
 
     # Evaluate on val split
-    python eval_v4.py --checkpoint runs/method3_crossattn/checkpoints/best.pt --split val
+    python eval_v4_5.py --checkpoint runs/method4_patch/checkpoints/best.pt --split val
 
     # Evaluate and save meshes for visualisation (pred + gt + template .obj files)
-    python eval_v4.py --checkpoint runs/method3_crossattn/checkpoints/best.pt --save-meshes
+    python eval_v4_5.py --checkpoint runs/method4_patch/checkpoints/best.pt --save-meshes
 
     # Scientific run with baselines (loads full train set — slower)
-    python eval_v4.py --checkpoint runs/method3_crossattn/checkpoints/best.pt --baselines
+    python eval_v4_5.py --checkpoint runs/method4_patch/checkpoints/best.pt --baselines
 ===============================================================================
 """
 
@@ -86,7 +96,7 @@ import dataloader_v2
 # Force the dataloader to ONLY use the front-facing angle
 dataloader_v2.CAMERA_ANGLES = ['000']
 from dataloader_v2 import GarmentDataset
-from models_v4 import UnfrozenCLSDrapeModel
+from models_v4_5 import UnfrozenPatchDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -103,7 +113,7 @@ FABRIC_FAMILIES = [
 SIZES = ['small', 'medium', 'large', 'xl', 'xxl']
 
 # Family group mapping (mirrors step1_json_to_csv.py)
-# NOTE: In v4, heavy_woven (group 6) is the UNSEEN fabric family.
+# NOTE: heavy_woven (group 6) is the UNSEEN fabric family.
 FAMILY_GROUP = {
     'light_knit': 1, 'medium_knit': 2, 'heavy_knit': 3,
     'light_woven': 4, 'medium_woven': 5, 'heavy_woven': 6,
@@ -147,7 +157,7 @@ def save_obj(path, verts, faces=None):
     """Save vertex positions (and optional faces) as a .obj file."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w') as f:
-        f.write("# Exported by eval_v4.py\n")
+        f.write("# Exported by eval_v4_5.py\n")
         for v in verts:
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f}\n")
         if faces is not None:
@@ -345,8 +355,8 @@ def evaluate(model, loader, device, results_dir,
                 by_family[fab_name].append(mve_val)
                 by_size[size_name].append(mve_val)
 
-                # ── v4 Generalization Condition Bucketing ─────────────────────
-                # heavy_woven (group 6) is the UNSEEN fabric family in v4.
+                # ── Generalization Condition Bucketing ────────────────────────
+                # heavy_woven (group 6) is the UNSEEN fabric family.
                 if body_id <= 22 and fab_group <= 5:
                     gen_cond = 'seen_body_seen_mat'
                 elif body_id <= 12 and fab_group == 6:
@@ -464,7 +474,7 @@ def print_results(stats, df, by_family, by_size, by_gen, split, baselines=None):
     mve_overall = stats['mve']
 
     print(f"\n{'='*70}")
-    print(f"EVALUATION RESULTS — {split.upper()}")
+    print(f"EVALUATION RESULTS (v4.5) — {split.upper()}")
     print(f"{'='*70}")
     print(f"  Samples evaluated:       {stats['n_samples']}")
     print(f"  Classification Accuracy: {stats['cls_acc']:.1%}")
@@ -578,15 +588,18 @@ def main():
     if 'best_val_loss' in ckpt:
         print(f"Best val loss:    {ckpt['best_val_loss']:.4f}")
 
-    model = UnfrozenCLSDrapeModel(
+    # v4.5 defaults: lora_rank=8, lora_alpha=16 (doubled from v4)
+    model = UnfrozenPatchDrapeModel(
         gnn_layers        = cfg.get('gnn_layers', 8),
         embed_dim         = cfg.get('embed_dim',  128),
         latent_dim        = cfg.get('latent_dim', 128),
         cross_attn_layers = cfg.get('cross_attn_layers', None),
+        lora_rank         = cfg.get('lora_rank',  8),
+        lora_alpha        = cfg.get('lora_alpha', 16),
     ).to(device)
     model.load_state_dict(ckpt['model_state'])
     model.eval()
-    print("Model loaded.")
+    print("Model v4.5 loaded.")
 
     # ── Load Data ─────────────────────────────────────────────────────────────
     print(f"\nLoading {args.split} dataset from {args.data_root}...")
@@ -632,9 +645,10 @@ def main():
 
     # ── Save JSON Summary ─────────────────────────────────────────────────────
     summary = {
-        'checkpoint': args.checkpoint,
-        'split':      args.split,
-        'epoch':      ckpt.get('epoch'),
+        'checkpoint':    args.checkpoint,
+        'model_version': 'v4.5',
+        'split':         args.split,
+        'epoch':         ckpt.get('epoch'),
         **rounded_stats,
         'baselines':  rounded_baselines,
         'by_family':  {k: round(float(np.mean(v)), 3) for k, v in by_family.items()},

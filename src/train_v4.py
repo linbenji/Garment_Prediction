@@ -30,11 +30,11 @@ from models_v4 import UnfrozenCLSDrapeModel, AutomaticLossWeighter, drape_loss, 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-#DATA_ROOT = '/workspace/batch_1500_lean'
-#RUNS_DIR  = '/workspace/runs'
+DATA_ROOT = '/workspace/batch_1500_lean'
+RUNS_DIR  = '/workspace/runs'
 
-DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
-RUNS_DIR   = r"/Users/Ben/Desktop/runs"
+#DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
+#RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
 #DATA_ROOT  = r"C:\Dev\Clothing_Project\batches\batch_1500_lean"
 #RUNS_DIR   = r"C:\Dev\Clothing_Project\batches\runs"
@@ -75,7 +75,7 @@ CONFIG = {
 
     # Surface quality losses
     'use_normal_consistency': True,
-    'use_bending_energy':     False,
+    'use_bending_energy':     True,
     'use_laplacian':          False,
 
     # Loss priors
@@ -83,11 +83,11 @@ CONFIG = {
     'prior_strain':    0.2,
     'prior_cls':       0.1,
     'prior_normal':    0.5,
-    'prior_bending':   0.3,
+    'prior_bending':   0.5,
     'prior_laplacian': 0.1,
 
     # Freeze loss weighter (priors become fixed weights, no adaptation)
-    'freeze_weighter': False,
+    'freeze_weighter': True,
 
     # Logging
     'log_every':       10,
