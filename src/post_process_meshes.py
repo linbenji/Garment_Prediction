@@ -146,4 +146,4 @@ def process_directory(directory, template_path, iterations, lambda_val):
 # MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
-    process_directory(DIRECTORY_PATH, NUM_ITERATIONS, LAMBDA_FILTER)
+    process_directory(DIRECTORY_PATH, TEMPLATE_MESH_PATH, NUM_ITERATIONS, LAMBDA_FILTER)
