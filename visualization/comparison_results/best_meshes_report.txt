@@ -1,0 +1,80 @@
+BEST & WORST MESH PREDICTIONS
+======================================================================
+MVE = Mean Vertex Error in millimetres. Lower = better.
+Note: this is MVE, not MSE. MVE is the mean of per-vertex L2
+distances. MSE would square those — MVE is more interpretable.
+
+Model: model_v3_master_bend
+  Saved samples: 76  |  Mean MVE: 4.29 mm
+  BEST 5:
+       2.80 mm  body014_heavy_woven_small_pass1_mve2.8mm_pred.obj
+       2.80 mm  body014_heavy_woven_small_pass0_mve2.8mm_pred.obj
+       2.80 mm  body014_heavy_woven_small_pass2_mve2.8mm_pred.obj
+       3.00 mm  body013_heavy_woven_small_pass0_mve3.0mm_pred.obj
+       3.00 mm  body015_heavy_woven_small_pass1_mve3.0mm_pred.obj
+  WORST 5:
+       6.50 mm  body013_heavy_woven_xxl_pass2_mve6.5mm_pred.obj
+       6.50 mm  body013_heavy_woven_xxl_pass1_mve6.5mm_pred.obj
+       6.50 mm  body013_heavy_woven_xxl_pass0_mve6.5mm_pred.obj
+       6.40 mm  body015_heavy_woven_xxl_pass2_mve6.4mm_pred.obj
+       6.30 mm  body015_heavy_woven_xxl_pass1_mve6.3mm_pred.obj
+
+Model: model_v3_master_laplacian
+  Saved samples: 86  |  Mean MVE: 4.45 mm
+  BEST 5:
+       2.80 mm  body014_heavy_woven_small_pass0_mve2.8mm_pred.obj
+       2.80 mm  body014_heavy_woven_small_pass2_mve2.8mm_pred.obj
+       2.90 mm  body014_heavy_woven_small_pass1_mve2.9mm_pred.obj
+       3.00 mm  body014_heavy_woven_small_pass1_mve3.0mm_pred.obj
+       3.00 mm  body014_heavy_woven_small_pass0_mve3.0mm_pred.obj
+  WORST 5:
+       6.80 mm  body015_heavy_woven_xxl_pass1_mve6.8mm_pred.obj
+       6.70 mm  body013_heavy_woven_xxl_pass1_mve6.7mm_pred.obj
+       6.70 mm  body015_heavy_woven_xxl_pass2_mve6.7mm_pred.obj
+       6.70 mm  body013_heavy_woven_xxl_pass0_mve6.7mm_pred.obj
+       6.70 mm  body013_heavy_woven_xxl_pass2_mve6.7mm_pred.obj
+
+Model: model_v3_norm_8x
+  Saved samples: 84  |  Mean MVE: 4.79 mm
+  BEST 5:
+       3.00 mm  body014_heavy_woven_small_pass0_mve3.0mm_pred.obj
+       3.00 mm  body014_heavy_woven_small_pass2_mve3.0mm_pred.obj
+       3.10 mm  body014_heavy_woven_small_pass1_mve3.1mm_pred.obj
+       3.20 mm  body014_heavy_woven_small_pass2_mve3.2mm_pred.obj
+       3.20 mm  body014_heavy_woven_small_pass1_mve3.2mm_pred.obj
+  WORST 5:
+       7.00 mm  body015_heavy_woven_xxl_pass1_mve7.0mm_pred.obj
+       7.00 mm  body013_heavy_woven_xxl_pass2_mve7.0mm_pred.obj
+       7.00 mm  body015_heavy_woven_xxl_pass0_mve7.0mm_pred.obj
+       7.00 mm  body013_heavy_woven_xxl_pass1_mve7.0mm_pred.obj
+       7.00 mm  body013_heavy_woven_xxl_pass0_mve7.0mm_pred.obj
+
+Model: model_v4_5_lora_patch
+  Saved samples: 82  |  Mean MVE: 3.57 mm
+  BEST 5:
+       2.30 mm  body014_heavy_woven_small_pass2_mve2.3mm_pred.obj
+       2.30 mm  body014_heavy_woven_small_pass1_mve2.3mm_pred.obj
+       2.30 mm  body014_heavy_woven_small_pass0_mve2.3mm_pred.obj
+       2.40 mm  body013_heavy_woven_small_pass1_mve2.4mm_pred.obj
+       2.40 mm  body013_heavy_woven_small_pass0_mve2.4mm_pred.obj
+  WORST 5:
+       5.90 mm  body013_heavy_woven_xxl_pass0_mve5.9mm_pred.obj
+       5.90 mm  body013_heavy_woven_xxl_pass1_mve5.9mm_pred.obj
+       5.90 mm  body013_heavy_woven_xxl_pass2_mve5.9mm_pred.obj
+       5.80 mm  body015_heavy_woven_xxl_pass2_mve5.8mm_pred.obj
+       5.80 mm  body015_heavy_woven_xxl_pass1_mve5.8mm_pred.obj
+
+Model: model_v4_lora_cls_bend
+  Saved samples: 77  |  Mean MVE: 4.49 mm
+  BEST 5:
+       2.70 mm  body015_heavy_woven_small_pass2_mve2.7mm_pred.obj
+       2.70 mm  body015_heavy_woven_small_pass1_mve2.7mm_pred.obj
+       2.70 mm  body015_heavy_woven_small_pass0_mve2.7mm_pred.obj
+       2.80 mm  body014_heavy_woven_small_pass1_mve2.8mm_pred.obj
+       2.80 mm  body014_heavy_woven_small_pass0_mve2.8mm_pred.obj
+  WORST 5:
+       6.80 mm  body013_heavy_woven_xxl_pass2_mve6.8mm_pred.obj
+       6.80 mm  body013_heavy_woven_xxl_pass1_mve6.8mm_pred.obj
+       6.80 mm  body013_heavy_woven_xxl_pass0_mve6.8mm_pred.obj
+       6.70 mm  body013_heavy_woven_xxl_pass1_mve6.7mm_pred.obj
+       6.70 mm  body013_heavy_woven_xxl_pass2_mve6.7mm_pred.obj

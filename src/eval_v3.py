@@ -548,7 +548,13 @@ def main():
 
     # Save and Print
     with open(os.path.join(results_dir, 'summary_stats.json'), 'w') as f:
-        json.dump({**rounded_stats, 'baselines': rounded_baselines}, f, indent=2, cls=NumpyEncoder)
+        json.dump({
+            **rounded_stats,
+            'baselines': rounded_baselines,
+            'by_family': {k: round(float(np.mean(v)), 3) for k, v in by_family.items()},
+            'by_size': {k: round(float(np.mean(v)), 3) for k, v in by_size.items()},
+            'by_gen': {k: round(float(np.mean(v)), 3) for k, v in by_gen.items()},
+        }, f, indent=2, cls=NumpyEncoder)
 
     print_results(stats, df, by_family, by_size, by_gen, baselines)
     print(f"\nAll plots and tables saved to: {results_dir}")
