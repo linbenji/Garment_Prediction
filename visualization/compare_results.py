@@ -575,9 +575,7 @@ def save_mesh_report(mesh_report, out_dir):
     lines = []
     lines.append("BEST & WORST MESH PREDICTIONS")
     lines.append("=" * 70)
-    lines.append("MVE = Mean Vertex Error in millimetres. Lower = better.")
-    lines.append("Note: this is MVE, not MSE. MVE is the mean of per-vertex L2")
-    lines.append("distances. MSE would square those — MVE is more interpretable.")
+    lines.append("MVE = Mean Vertex Error in millimetres.")
     lines.append("")
     for label, data in mesh_report.items():
         lines.append(f"Model: {label}")

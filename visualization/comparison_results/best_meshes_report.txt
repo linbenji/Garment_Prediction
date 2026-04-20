@@ -1,8 +1,6 @@
 BEST & WORST MESH PREDICTIONS
 ======================================================================
-MVE = Mean Vertex Error in millimetres. Lower = better.
-Note: this is MVE, not MSE. MVE is the mean of per-vertex L2
-distances. MSE would square those — MVE is more interpretable.
+MVE = Mean Vertex Error in millimetres.
 
 Model: model_v3_master_bend
   Saved samples: 76  |  Mean MVE: 4.29 mm
