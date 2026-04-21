@@ -71,7 +71,7 @@ def save_colored_obj(path, verts, colors, faces=None):
         for v, c in zip(verts, colors):
             f.write(f"v {v[0]:.4f} {v[1]:.4f} {v[2]:.4f} {c[0]:.4f} {c[1]:.4f} {c[2]:.4f}\n")
         if faces is not None:
-            for face in faces:
+            for  face in faces:
                 f.write(f"f {face[0] + 1} {face[1] + 1} {face[2] + 1}\n")
 
 

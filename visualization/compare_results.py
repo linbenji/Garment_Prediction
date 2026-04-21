@@ -105,7 +105,10 @@ MODELS_TO_COMPARE = [
     "model_v3_master_laplacian",
     "model_v3_norm_8x",
     "model_v4_5_lora_patch",
-    "model_v4_lora_cls_bend"
+    "model_v4_lora_cls_bend",
+    "model_v3_midpoint_collision",
+    "model_v3_5"
+
 ]
 
 # Consistent model colours across all plots

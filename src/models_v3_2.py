@@ -1,5 +1,5 @@
 """
-models_v3.py (Final Master Architecture) — PATCHED
+models_v3_2.py (Final Master Architecture) — PATCHED
 
 MasterDrapeModel: DINOv2 (Frozen) + FiLM-Modulated MeshGraphNet + Physics Triad Loss
 

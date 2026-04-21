@@ -1,5 +1,5 @@
 """
-train_v3.py — PATCHED (midpoint priors + active collision)
+train_v3_2.py — PATCHED (midpoint priors + active collision)
 
 Training loop for MasterDrapeModel (DINO + FiLM GNN).
 Supports normal consistency, bending energy, Laplacian, and collision losses.
@@ -58,7 +58,7 @@ torch.cuda.empty_cache()
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataloader_v2 import GarmentDataset
-from models_v3 import (
+from models_v3_2 import (
     MasterDrapeModel, AutomaticLossWeighter,
     drape_loss, build_face_adjacency, compute_laplacian_loss,
 )
@@ -84,8 +84,8 @@ CONFIG = {
     'subset_size':     50 if DEBUG else None,
 
     # Training
-    'max_epochs':      2   if DEBUG else 100,
-    'early_stop_patience': 15,
+    'max_epochs':      2   if DEBUG else 500,
+    'early_stop_patience': 40,
     'grad_clip':       1.0,
 
     # Optimiser
@@ -93,9 +93,9 @@ CONFIG = {
     'weight_decay':    1e-4,
 
     # Scheduler
-    'lr_patience':     5,
+    'lr_patience':     12,
     'lr_factor':       0.5,
-    'lr_min':          1e-6,
+    'lr_min':          1e-7,
 
     # Model
     'embed_dim':       128,
@@ -116,11 +116,11 @@ CONFIG = {
     # + collision if enabled
     'prior_drape':     1.0,
     'prior_strain':    0.1,            # halved: asymmetric strain is ~3-4x larger
-    'prior_cls':       0.1,
+    'prior_cls':       0.05,
     'prior_normal':    2.25,           # midpoint between master_bend (0.5) and norm_8x (4.0)
     'prior_bending':   0.3,
     'prior_laplacian': 0.0,
-    'prior_collision': 1.0,            # NEW: first-pass value, re-tune after first run
+    'prior_collision': 1.5,            # NEW: first-pass value, re-tune after first run
 
     # If True,  the AutomaticLossWeighter's log_vars so the priors above
     # are the *final* effective weights, not just starting values. Use for
