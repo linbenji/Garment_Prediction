@@ -93,7 +93,7 @@ from collections import defaultdict
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-RUNS_DIR      = '/Users/Ben/Desktop/training_results'
+RUNS_DIR      = r"C:\Users\chung\Desktop\Garment_Prediction\results"
 DEFAULT_SPLIT = 'test'
 DEFAULT_OUT   = 'comparison_results'
 TOP_N         = 5   # best and worst meshes reported per model
@@ -101,15 +101,22 @@ TOP_N         = 5   # best and worst meshes reported per model
 # Models to compare — use the exact folder names inside RUNS_DIR.
 # Leave the list empty to compare every model that has eval results.
 MODELS_TO_COMPARE = [
+    "method1_baseline",
     "model_v3_master_bend",
-    "model_v3_master_laplacian",
-    "model_v3_norm_8x",
-    "model_v4_5_lora_patch",
-    "model_v4_lora_cls_bend",
     "model_v3_midpoint_collision",
-    "model_v3_5"
-
+    "model_v4_lora_cls_bend",
+    "model_v4_5_lora_patch"
 ]
+
+# Custom display names for plots and tables. 
+# If a folder isn't in this list, the script will just use the folder name.
+MODEL_DISPLAY_NAMES = {
+    "method1_baseline": "Baseline (ViT + Concat.)",
+    "model_v3_master_bend": "v3 (DINO + FiLM) + Normal & Bending Loss",
+    "model_v3_midpoint_collision": "v3 + Collision Loss (w/Norm., Bend., Lapl.)",
+    "model_v4_lora_cls_bend": "v4 (LoRA + CLS)",
+    "model_v4_5_lora_patch": "v4.5 (LoRA + Patch)"
+}
 
 # Consistent model colours across all plots
 PALETTE = [
@@ -256,7 +263,13 @@ def discover_runs(runs_dir, split, explicit_runs=None):
             continue
         with open(json_path) as f:
             data = json.load(f)
-        label = run_dir.name
+        
+        # Get the original folder name
+        raw_name = run_dir.name
+        
+        # Look up the custom name, fallback to the raw folder name if not found
+        label = MODEL_DISPLAY_NAMES.get(raw_name, raw_name)
+        
         results[label] = {
             'data':     data,
             'run_dir':  run_dir,
@@ -399,11 +412,11 @@ def plot_metric_comparison(runs, out_dir):
         axes[ax_idx].set_visible(False)
 
     # Shared legend
-    patches = [mpatches.Patch(color=colors[i], label=labels[i])
-               for i in range(len(labels))]
-    fig.legend(handles=patches, loc='lower center',
-               ncol=min(len(labels), 4), fontsize=8,
-               bbox_to_anchor=(0.5, -0.02), frameon=False)
+    # patches = [mpatches.Patch(color=colors[i], label=labels[i])
+    #            for i in range(len(labels))]
+    # fig.legend(handles=patches, loc='lower center',
+    #            ncol=min(len(labels), 4), fontsize=8,
+    #            bbox_to_anchor=(0.5, -0.02), frameon=False)
 
     fig.suptitle("Model Comparison — Key Metrics  (★ = best per metric)",
                  fontsize=13, fontweight='bold', y=1.01)
