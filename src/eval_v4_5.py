@@ -100,8 +100,10 @@ from models_v4_5 import UnfrozenPatchDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_ROOT = '/workspace/batch_1500_lean'
-RUNS_DIR  = '/workspace/runs'
+# DATA_ROOT = '/workspace/batch_1500_lean'
+# RUNS_DIR  = '/workspace/runs'
+
+DATA_ROOT  = r'C:\Users\chung\Desktop\Garment_Prediction\dataset\batch_1500_lean'
 
 #DATA_ROOT = r"/Users/Ben/Desktop/batch_1500_lean"
 #RUNS_DIR  = r"/Users/Ben/Desktop/runs"
@@ -122,7 +124,7 @@ FAMILY_GROUP = {
 FABRIC_FAMILY_IDX = {f: i for i, f in enumerate(FABRIC_FAMILIES)}
 
 # Global flag: True = cap mesh saves at 30 per pass, False = save all 180
-SUBSET_SAVE = True
+SUBSET_SAVE = False
 
 # Define what constitutes Great, Good, and Acceptable for each metric
 THRESHOLDS = {
@@ -298,7 +300,8 @@ def evaluate(model, loader, device, results_dir,
 
         for batch in loader:
             batch = batch.to(device)
-            pred_delta, fabric_logits = model(batch)
+            with torch.amp.autocast('cuda', dtype=torch.float16):
+                pred_delta, fabric_logits = model(batch)
 
             # Classification accuracy
             preds_cls    = fabric_logits.argmax(dim=1)
@@ -378,8 +381,12 @@ def evaluate(model, loader, device, results_dir,
                 # ── Mesh Saving ───────────────────────────────────────────────
                 if save_meshes and (not SUBSET_SAVE or samples_this_pass < 30):
                     pos    = batch.pos[mask].cpu().numpy()
-                    prefix = (f"body{body_id:03d}_{fab_name}_{size_name}"
-                              f"_pass{pass_idx}_mve{mve_val:.1f}mm")
+
+                    # 1. Grab the unique sample name from the batch
+                    uid = batch.sample_name[i]
+                    
+                    # 2. Add it to the prefix!
+                    prefix = f"{uid}_body{body_id:03d}_{fab_name}_{size_name}_pass{pass_idx}_mve{mve_val:.1f}mm"
                     save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"), p_verts, faces)
                     save_obj(os.path.join(mesh_dir, f"{prefix}_gt.obj"),   g_verts, faces)
                     # Template (T-pose) does not change across passes — save once

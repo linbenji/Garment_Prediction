@@ -100,10 +100,10 @@ from models_v2 import HybridDrapeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_ROOT = '/workspace/batch_1500_lean'
-RUNS_DIR  = '/workspace/runs'
+# DATA_ROOT = '/workspace/batch_1500_lean'
+# RUNS_DIR  = '/workspace/runs'
 
-# DATA_ROOT  = r'C:\Users\chung\Desktop\Garment_Prediction\dataset\batch_1500_lean'
+DATA_ROOT  = r'C:\Users\chung\Desktop\Garment_Prediction\dataset\batch_1500_lean'
 # DATA_ROOT  = r"/Users/Ben/Desktop/batch_1500_lean"
 # RUNS_DIR   = r"/Users/Ben/Desktop/runs"
 
@@ -365,7 +365,11 @@ def evaluate(model, loader, device, results_dir, save_meshes=False, faces=None, 
                 if save_meshes and (not SUBSET_SAVE or samples_this_pass < 30):
                     # Added 'pass_idx' to the filename so 3 different 
                     # random input pairings don't overwrite each other
-                    prefix = f"body{body_id:03d}_{fab_name}_{size_name}_pass{pass_idx}_mve{mve:.1f}mm"
+                    # 1. Grab the unique sample name from the batch
+                    uid = batch.sample_name[i]
+                    
+                    # 2. Add it to the prefix!
+                    prefix = f"{uid}_body{body_id:03d}_{fab_name}_{size_name}_pass{pass_idx}_mve{mve:.1f}mm"
                     
                     # Save Prediction and Ground Truth only
                     save_obj(os.path.join(mesh_dir, f"{prefix}_pred.obj"), p_verts, faces)
