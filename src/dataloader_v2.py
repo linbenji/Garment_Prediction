@@ -23,6 +23,7 @@ Expected directory layout:
 """
 
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
 import json
 import random
 import numpy as np
@@ -269,6 +270,7 @@ if __name__ == '__main__':
     import sys
     root = sys.argv[1] if len(sys.argv) > 1 \
            else r'C:\Dev\Clothing_Project\batches\batch_1500_lean'
+        #    else r'C:\Users\chung\Desktop\Garment_Prediction\dataset\batch_1500_lean'
 
     print("=" * 65)
     print("DATALOADER SMOKE TEST")
