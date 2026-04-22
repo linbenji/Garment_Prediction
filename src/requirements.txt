@@ -1,0 +1,35 @@
+# Garment Drape Prediction — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# PyTorch and PyG must be installed separately with the correct CUDA version:
+#
+# Local (CUDA 12.4):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch_geometric
+#   pip install torch_scatter torch_sparse torch_cluster torch_spline_conv \
+#       -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
+#
+# Vast.ai — check CUDA version first with: nvidia-smi
+# Then replace cu124 with the correct version (cu121, cu124, etc.)
+
+# Core ML
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Experiment tracking
+tensorboard>=2.14.0
+wandb>=0.16.0
+
+# Utilities
+tqdm>=4.65.0
+matplotlib>=3.7.0
+
+# For Loading ViT-Small
+timm>=1.0.0
+
+# Optional — for mesh visualisation (install separately if needed)
+# trimesh>=4.0.0
+# pyrender>=0.1.45

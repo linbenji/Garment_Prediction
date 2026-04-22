@@ -1,0 +1,78 @@
+BEST & WORST MESH PREDICTIONS
+======================================================================
+MVE = Mean Vertex Error in millimetres.
+
+Model: Baseline (ViT + Concat.)
+  Saved samples: 540  |  Mean MVE: 13.06 mm
+  BEST 5:
+       5.50 mm  body014_lean_denim_medium_body014_heavy_woven_medium_pass0_mve5.5mm_pred.obj
+       5.50 mm  body014_lean_denim_medium_body014_heavy_woven_medium_pass1_mve5.5mm_pred.obj
+       5.50 mm  body014_lean_denim_medium_body014_heavy_woven_medium_pass2_mve5.5mm_pred.obj
+       5.60 mm  body014_lean_canvas_medium_body014_heavy_woven_medium_pass0_mve5.6mm_pred.obj
+       5.70 mm  body014_lean_canvas_medium_body014_heavy_woven_medium_pass2_mve5.7mm_pred.obj
+  WORST 5:
+      24.20 mm  body023_lean_neoprene_scuba_small_body023_heavy_knit_small_pass1_mve24.2mm_pred.obj
+      24.10 mm  body023_lean_chiffon_small_body023_light_woven_small_pass2_mve24.1mm_pred.obj
+      24.10 mm  body023_lean_chiffon_small_body023_light_woven_small_pass1_mve24.1mm_pred.obj
+      24.00 mm  body023_lean_organza_small_body023_light_woven_small_pass2_mve24.0mm_pred.obj
+      24.00 mm  body023_lean_organza_small_body023_light_woven_small_pass1_mve24.0mm_pred.obj
+
+Model: v3 (DINO + FiLM) + Normal & Bending Loss
+  Saved samples: 540  |  Mean MVE: 12.62 mm
+  BEST 5:
+       2.80 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass0_mve2.8mm_pred.obj
+       2.80 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass1_mve2.8mm_pred.obj
+       2.80 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass2_mve2.8mm_pred.obj
+       2.80 mm  body014_lean_denim_small_body014_heavy_woven_small_pass0_mve2.8mm_pred.obj
+       2.80 mm  body014_lean_denim_small_body014_heavy_woven_small_pass1_mve2.8mm_pred.obj
+  WORST 5:
+      35.00 mm  body023_lean_satin_small_body023_medium_woven_small_pass0_mve35.0mm_pred.obj
+      35.00 mm  body023_lean_chiffon_small_body023_light_woven_small_pass0_mve35.0mm_pred.obj
+      34.80 mm  body023_lean_satin_small_body023_medium_woven_small_pass2_mve34.8mm_pred.obj
+      34.80 mm  body023_lean_chiffon_small_body023_light_woven_small_pass2_mve34.8mm_pred.obj
+      34.80 mm  body023_lean_chiffon_small_body023_light_woven_small_pass1_mve34.8mm_pred.obj
+
+Model: v3 + Collision Loss (w/Norm., Bend., Lapl.)
+  Saved samples: 540  |  Mean MVE: 11.83 mm
+  BEST 5:
+       3.00 mm  body014_lean_denim_small_body014_heavy_woven_small_pass0_mve3.0mm_pred.obj
+       3.00 mm  body014_lean_denim_small_body014_heavy_woven_small_pass1_mve3.0mm_pred.obj
+       3.00 mm  body014_lean_denim_small_body014_heavy_woven_small_pass2_mve3.0mm_pred.obj
+       3.10 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass0_mve3.1mm_pred.obj
+       3.10 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass1_mve3.1mm_pred.obj
+  WORST 5:
+      30.00 mm  body023_lean_neoprene_scuba_xl_body023_heavy_knit_xl_pass1_mve30.0mm_pred.obj
+      30.00 mm  body023_lean_neoprene_scuba_xl_body023_heavy_knit_xl_pass0_mve30.0mm_pred.obj
+      29.70 mm  body023_lean_neoprene_scuba_xl_body023_heavy_knit_xl_pass2_mve29.7mm_pred.obj
+      29.60 mm  body023_lean_flannel_xl_body023_medium_woven_xl_pass1_mve29.6mm_pred.obj
+      29.60 mm  body023_lean_denim_xl_body023_heavy_woven_xl_pass0_mve29.6mm_pred.obj
+
+Model: v4 (LoRA + CLS)
+  Saved samples: 540  |  Mean MVE: 14.45 mm
+  BEST 5:
+       2.70 mm  body015_lean_canvas_small_body015_heavy_woven_small_pass0_mve2.7mm_pred.obj
+       2.70 mm  body015_lean_canvas_small_body015_heavy_woven_small_pass1_mve2.7mm_pred.obj
+       2.70 mm  body015_lean_canvas_small_body015_heavy_woven_small_pass2_mve2.7mm_pred.obj
+       2.70 mm  body015_lean_denim_small_body015_heavy_woven_small_pass0_mve2.7mm_pred.obj
+       2.70 mm  body015_lean_denim_small_body015_heavy_woven_small_pass1_mve2.7mm_pred.obj
+  WORST 5:
+      42.80 mm  body023_lean_fleece_xl_body023_heavy_knit_xl_pass2_mve42.8mm_pred.obj
+      42.80 mm  body023_lean_fleece_xl_body023_heavy_knit_xl_pass1_mve42.8mm_pred.obj
+      42.80 mm  body023_lean_fleece_xl_body023_heavy_knit_xl_pass0_mve42.8mm_pred.obj
+      42.70 mm  body023_lean_neoprene_scuba_xl_body023_heavy_knit_xl_pass2_mve42.7mm_pred.obj
+      42.70 mm  body023_lean_neoprene_scuba_xl_body023_heavy_knit_xl_pass0_mve42.7mm_pred.obj
+
+Model: v4.5 (LoRA + Patch)
+  Saved samples: 540  |  Mean MVE: 14.48 mm
+  BEST 5:
+       2.30 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass0_mve2.3mm_pred.obj
+       2.30 mm  body014_lean_canvas_small_body014_heavy_woven_small_pass2_mve2.3mm_pred.obj
+       2.30 mm  body014_lean_denim_small_body014_heavy_woven_small_pass0_mve2.3mm_pred.obj
+       2.30 mm  body014_lean_denim_small_body014_heavy_woven_small_pass1_mve2.3mm_pred.obj
+       2.30 mm  body014_lean_denim_small_body014_heavy_woven_small_pass2_mve2.3mm_pred.obj
+  WORST 5:
+      45.90 mm  body023_lean_canvas_xl_body023_heavy_woven_xl_pass2_mve45.9mm_pred.obj
+      45.90 mm  body023_lean_canvas_xl_body023_heavy_woven_xl_pass1_mve45.9mm_pred.obj
+      45.80 mm  body023_lean_canvas_xl_body023_heavy_woven_xl_pass0_mve45.8mm_pred.obj
+      45.40 mm  body023_lean_denim_xl_body023_heavy_woven_xl_pass0_mve45.4mm_pred.obj
+      45.30 mm  body023_lean_denim_xl_body023_heavy_woven_xl_pass1_mve45.3mm_pred.obj
