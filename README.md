@@ -12,8 +12,6 @@ Most virtual try-on systems answer the question *"what would I look like wearing
 
 The model takes a rendered shirt image, a 3D garment template mesh, SMPL body shape parameters, fabric physics properties, and a garment size encoding — and outputs a per-vertex 3D displacement field. Adding that displacement to the template mesh gives the final draped garment. No physics simulation required at inference time.
 
-This is the physics oracle layer that sits underneath a full virtual try-on pipeline. The predicted mesh is a queryable 3D object: you can compute per-region fabric clearance, identify tight vs. loose zones, derive a fit score, or render it from any angle via a downstream 3DGS or NeRF renderer.
-
 ---
 
 ## Qualitative Results
