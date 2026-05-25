@@ -20,11 +20,11 @@ This is the physics oracle layer that sits underneath a full virtual try-on pipe
 
 **Front view** — ground truth vs. v3.5 vs. v4.5 (post-processed)
 
-![Front view: ground truth, v3.5, v4.5](docs/renders_front.png)
+![Front view: ground truth, v3.5, v4.5](docs/front_render.png)
 
 **Back view** — ground truth vs. v3.5 vs. v4.5 (post-processed)
 
-![Back view: ground truth, v3.5, v4.5](docs/renders_back.png)
+![Back view: ground truth, v3.5, v4.5](docs/back_render.png)
 
 ---
 
