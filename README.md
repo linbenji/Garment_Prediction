@@ -94,7 +94,7 @@ template_mesh + displacement = draped garment mesh
 | Bodies | 25 SMPL male bodies, 5'4"–6'4", grid-sampled |
 | Fabrics | 12 presets across 6 families (light/medium/heavy × knit/woven) |
 | Sizes | S, M, L, XL, XXL |
-| Poses | Lean pose (A-pose variant) |
+| Poses | A-Pose | Lean pose (A-pose variant) | Clasped Pose |
 | Rendered images | 8 camera angles × 6 shirt colors = 72K images at 512×512 |
 
 **Two-axis train/val/test split** — held out along both body and material axes independently:
